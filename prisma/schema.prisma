@@ -1,0 +1,335 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+  SUPER_ADMIN
+  DELIVERY_GUY
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  IN_PROGRESS
+  READY_FOR_PICKUP
+  OUT_FOR_DELIVERY
+  DELIVERED
+  COMPLETED
+  CANCELED
+  REFUNDED
+}
+
+enum LaundryStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING  
+}
+
+enum ActivityType {
+  ORDER_CREATED
+  ORDER_DELIVERED
+  ORDER_UPDATED
+  ORDER_COMPLETED
+  ORDER_CANCELED
+  ORDER_PENDING
+  ORDER_CONFIRMED
+  LAUNDRY_REGISTERED
+  LAUNDRY_UPDATED
+  LAUNDRY_SUSPENDED
+  LAUNDRY_ACTIVATED
+  REVIEW_ADDED
+  USER_REGISTERED
+  CUSTOMER_ADDED
+  CUSTOMER_UPDATED
+  CUSTOMER_DELETED
+  DELIVERY_ASSIGNED
+  DELIVERY_COMPLETED
+  DELIVERY_CANCELED
+  PRODUCT_CREATED
+  PRODUCT_ADDED
+  PRODUCT_UPDATED
+  PRODUCT_DELETED
+  ADDRESS_ADDED
+  ADDRESS_UPDATED
+  ADDRESS_DELETED
+  ANALYTICS_GENERATED
+  USER_SUSPENDED    // ← AJOUTER CETTE LIGNE
+  USER_REACTIVATED  // ← AJOUTER CETTE LIGNE
+
+}
+
+model User {
+  id                String    @id @default(cuid())
+  email             String    @unique
+  name              String?
+  phone             String?
+  password          String?   
+  role              UserRole  @default(CUSTOMER)
+  avatar            String?
+  emailVerified     DateTime? 
+  image             String?   
+  suspendedAt       DateTime? // ← Déjà ajouté précédemment
+  suspensionReason  String?   // ← AJOUTER CETTE LIGNE pour la raison de suspension
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  // Relations existantes
+  addresses Address[]
+  orders    Order[]
+  reviews   Review[]
+  laundry   Laundry? 
+  Activity  Activity[]
+
+  // Relations NextAuth
+  accounts Account[]
+  sessions Session[]
+
+  @@map("users")
+}
+
+// NOUVEAUX MODÈLES NextAuth
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// MODÈLES EXISTANTS (inchangés)
+model Address {
+  id          String  @id @default(cuid())
+  street      String
+  city        String
+  state       String
+  zipCode     String
+  country     String  @default("Morocco")
+  isDefault   Boolean @default(false)
+  latitude    Float?
+  longitude   Float?
+  userId      String        // ← Ce champ est requis
+  laundryId   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  laundry Laundry? @relation(fields: [laundryId], references: [id])
+  orders  Order[]
+
+  @@map("addresses")
+}
+
+model Laundry {
+  id                String        @id @default(cuid())
+  name              String
+  email             String        @unique
+  phone             String
+  description       String?
+  logo              String?
+  status            LaundryStatus @default(ACTIVE)
+  rating            Float         @default(0.0)
+  totalReviews      Int           @default(0)
+  totalOrders       Int           @default(0)
+  totalRevenue      Float         @default(0.0)
+  adminId           String        @unique
+  suspensionReason  String?       // Champ ajouté précédemment
+  suspendedAt       DateTime?     // Champ ajouté précédemment
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  // Operating Hours (JSON format)
+  operatingHours Json?
+
+  // Relations
+  admin       User                @relation(fields: [adminId], references: [id])
+  addresses   Address[]
+  products    Product[]
+  orders      Order[]
+  reviews     Review[]
+  activities  Activity[]
+  suspensions LaundrySuspension[] // ← AJOUTER CETTE LIGNE
+
+  @@map("laundries")
+}
+model Product {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  price       Float
+  unit        String  @default("piece") // piece, kg, item
+  category    String  // washing, drying, ironing, etc.
+  isActive    Boolean @default(true)
+  laundryId   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  laundry    Laundry     @relation(fields: [laundryId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@map("products")
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  orderNumber     String      @unique
+  status          OrderStatus @default(PENDING)
+  totalAmount     Float
+  deliveryFee     Float       @default(0.0)
+  discount        Float       @default(0.0)
+  finalAmount     Float
+  notes           String?
+  pickupDate      DateTime?
+  deliveryDate    DateTime?
+  customerId      String
+  laundryId       String
+  addressId       String
+  deliveryGuyId   String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  // Relations
+  customer    User        @relation(fields: [customerId], references: [id])
+  laundry     Laundry     @relation(fields: [laundryId], references: [id])
+  address     Address     @relation(fields: [addressId], references: [id])
+  orderItems  OrderItem[]
+  activities  Activity[]
+  reviews     Review[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id         String @id @default(cuid())
+  quantity   Int
+  price      Float
+  totalPrice Float
+  orderId    String
+  productId  String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // Relations
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@map("order_items")
+}
+
+model Review {
+  id         String   @id @default(cuid())
+  rating     Int      // 1-5 stars
+  comment    String?
+  customerId String
+  laundryId  String
+  orderId    String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // Relations
+  customer User     @relation(fields: [customerId], references: [id])
+  laundry  Laundry  @relation(fields: [laundryId], references: [id])
+  order    Order?   @relation(fields: [orderId], references: [id])
+
+  @@map("reviews")
+}
+
+model Activity {
+  id          String       @id @default(cuid())
+  type        ActivityType
+  title       String
+  description String?
+  metadata    Json?        // Additional data related to the activity
+  userId      String?
+  laundryId   String?
+  orderId     String?
+  createdAt   DateTime     @default(now())
+
+  // Relations
+  user    User?    @relation(fields: [userId], references: [id])
+  laundry Laundry? @relation(fields: [laundryId], references: [id])
+  order   Order?   @relation(fields: [orderId], references: [id])
+
+  @@map("activities")
+}
+
+// Analytics can be computed from other tables, but we can store some aggregated data
+model Analytics {
+  id                String   @id @default(cuid())
+  date              DateTime @db.Date
+  totalOrders       Int      @default(0)
+  totalRevenue      Float    @default(0.0)
+  totalUsers        Int      @default(0)
+  totalLaundries    Int      @default(0)
+  averageOrderValue Float    @default(0.0)
+  laundryId         String?  // If analytics are per laundry
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([date, laundryId])
+  @@map("analytics")
+}
+
+model LaundrySuspension {
+  id          String    @id @default(cuid())
+  laundryId   String
+  reason      String
+  suspendedBy String    // ID ou nom de l'admin qui a suspendu
+  suspendedAt DateTime  @default(now())
+  liftedAt    DateTime? // Quand la suspension est levée
+  liftedBy    String?   // ID ou nom de l'admin qui a levé la suspension
+  isActive    Boolean   @default(true)
+  metadata    Json?     // ← AJOUTER CE CHAMP pour stocker des informations supplémentaires
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  
+  // Relations
+  laundry Laundry @relation(fields: [laundryId], references: [id], onDelete: Cascade)
+
+  @@map("laundry_suspensions")
+}
+
+
