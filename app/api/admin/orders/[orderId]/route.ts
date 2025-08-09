@@ -1,27 +1,30 @@
-// app/api/admin/orders/[orderId]/route.ts
+// app/api/admin/orders/[orderId]/route.ts - ADMIN uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { NextRequest } from 'next/server'
+import { requireOrderAccess, successResponse, errorResponse } from '@/lib/auth-middleware'
+import { z } from 'zod'
 
+const updateOrderSchema = z.object({
+  status: z.enum(['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY', 'DELIVERED', 'COMPLETED', 'CANCELED']).optional(),
+  pickupDate: z.string().datetime().optional(),
+  deliveryDate: z.string().datetime().optional(),
+  notes: z.string().max(1000).optional()
+})
+
+// GET /api/admin/orders/[orderId] - ADMIN uniquement
 export async function GET(
   request: NextRequest,
   { params }: { params: { orderId: string } }
 ) {
+  const authResult = await requireOrderAccess(request, params.orderId)
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
   try {
-    const { orderId } = params
-    const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
-    }
-
-    // Get comprehensive order details
-    const order = await prisma.order.findFirst({
-      where: { 
-        id: orderId,
-        laundryId // Ensure order belongs to this laundry
-      },
+    const order = await prisma.order.findUnique({
+      where: { id: params.orderId },
       include: {
         customer: {
           select: {
@@ -29,25 +32,7 @@ export async function GET(
             name: true,
             email: true,
             phone: true,
-            avatar: true,
-            createdAt: true,
-            _count: {
-              select: {
-                orders: true,
-                reviews: true
-              }
-            }
-          }
-        },
-        address: {
-          select: {
-            id: true,
-            street: true,
-            city: true,
-            state: true,
-            zipCode: true,
-            latitude: true,
-            longitude: true
+            avatar: true
           }
         },
         orderItems: {
@@ -58,9 +43,31 @@ export async function GET(
                 name: true,
                 description: true,
                 category: true,
-                unit: true
+                unit: true,
+                price: true,
+                // estimatedDuration: true,
+                // specialInstructions: true
               }
             }
+          }
+        },
+        address: {
+          select: {
+            street: true,
+            city: true,
+            state: true,
+            zipCode: true,
+            country: true,
+            latitude: true,
+            longitude: true
+          }
+        },
+        laundry: {
+          select: {
+            id: true,
+            name: true,
+            phone: true,
+            email: true
           }
         },
         activities: {
@@ -69,10 +76,17 @@ export async function GET(
             type: true,
             title: true,
             description: true,
-            metadata: true,
-            createdAt: true
+            createdAt: true,
+            user: {
+              select: {
+                name: true,
+                role: true
+              }
+            }
           },
-          orderBy: { createdAt: 'desc' }
+          orderBy: {
+            createdAt: 'desc'
+          }
         },
         reviews: {
           select: {
@@ -87,139 +101,85 @@ export async function GET(
     })
 
     if (!order) {
-      return errorResponse('Order not found or does not belong to this laundry', 404)
+      return errorResponse('Order not found', 404)
     }
 
-    // Get customer statistics
-    const customerStats = await prisma.order.aggregate({
-      where: { 
-        customerId: order.customerId,
-        laundryId // Only orders from this laundry
-      },
-      _sum: { finalAmount: true },
-      _count: { id: true }
-    })
+    // // Calculer la durée estimée totale
+    // const estimatedDuration = order.orderItems.reduce((total, item) => {
+    //   const duration = item.product.estimatedDuration || 24 // 24h par défaut
+    //   return total + (duration * item.quantity)
+    // }, 0)
 
-    // Build status timeline from activities
-    const statusTimeline = order.activities
-      .filter(activity => activity.type.includes('ORDER'))
-      .map(activity => ({
-        status: activity.type.replace('ORDER_', ''),
-        timestamp: activity.createdAt,
-        title: activity.title,
-        description: activity.description
-      }))
-      .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+    // Calculer les statuts et délais
+    const now = new Date()
+    const isOverdue = order.deliveryDate && order.deliveryDate < now && 
+      !['DELIVERED', 'COMPLETED', 'CANCELED'].includes(order.status)
+    
+    const hoursUntilDelivery = order.deliveryDate 
+      ? Math.ceil((order.deliveryDate.getTime() - now.getTime()) / (1000 * 60 * 60))
+      : null
 
-    // Calculate delivery progress
-    const statusOrder = ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY', 'DELIVERED', 'COMPLETED']
-    const currentStatusIndex = statusOrder.indexOf(order.status)
-    const progressPercentage = currentStatusIndex >= 0 ? 
-      ((currentStatusIndex + 1) / statusOrder.length) * 100 : 0
-
-    // Format the comprehensive order details
     const orderDetails = {
-      // Basic Order Information
+      // Informations de base
       id: order.id,
       orderNumber: order.orderNumber,
       status: order.status,
       
-      // Financial Information
+      // Client
+      customer: order.customer,
+      
+      // Adresse de livraison
+      deliveryAddress: order.address,
+      
+      // // Articles commandés avec instructions spéciales
+      // items: order.orderItems.map(item => ({
+      //   id: item.id,
+      //   product: item.product,
+      //   quantity: item.quantity,
+      //   unitPrice: item.price,
+      //   totalPrice: item.totalPrice,
+      //   hasSpecialInstructions: !!item.product.specialInstructions
+      // })),
+      
+      // Résumé financier
       pricing: {
-        totalAmount: order.totalAmount,
+        subtotal: order.totalAmount,
         deliveryFee: order.deliveryFee || 0,
         discount: order.discount || 0,
         finalAmount: order.finalAmount
       },
       
-      // Customer Information
-      customer: {
-        id: order.customer.id,
-        name: order.customer.name || order.customer.email.split('@')[0],
-        email: order.customer.email,
-        phone: order.customer.phone,
-        avatar: order.customer.avatar,
-        memberSince: order.customer.createdAt,
-        stats: {
-          totalOrdersWithLaundry: customerStats._count.id,
-          totalSpentWithLaundry: customerStats._sum.finalAmount || 0,
-          totalOrdersOverall: order.customer._count.orders,
-          totalReviews: order.customer._count.reviews
-        }
-      },
-      
-      // Delivery Information
-      deliveryAddress: {
-        id: order.address.id,
-        street: order.address.street,
-        city: order.address.city,
-        state: order.address.state,
-        zipCode: order.address.zipCode,
-        coordinates: order.address.latitude && order.address.longitude ? {
-          latitude: order.address.latitude,
-          longitude: order.address.longitude
-        } : null
-      },
-      
-      // Order Items
-      items: order.orderItems.map(item => ({
-        id: item.id,
-        product: {
-          id: item.product.id,
-          name: item.product.name,
-          description: item.product.description,
-          category: item.product.category,
-          unit: item.product.unit
-        },
-        quantity: item.quantity,
-        unitPrice: item.price,
-        totalPrice: item.totalPrice
-      })),
-      
-      // Order Summary
-      summary: {
-        totalItems: order.orderItems.length,
-        totalQuantity: order.orderItems.reduce((sum, item) => sum + item.quantity, 0),
-        categories: Array.from(new Set(order.orderItems.map(item => item.product.category))),
-        averageItemPrice: order.orderItems.length > 0 ? 
-          order.orderItems.reduce((sum, item) => sum + item.price, 0) / order.orderItems.length : 0
-      },
-      
-      // Important Dates
-      dates: {
+      // Dates importantes
+      timeline: {
         orderDate: order.createdAt,
         pickupDate: order.pickupDate,
         deliveryDate: order.deliveryDate,
-        lastUpdated: order.updatedAt
+        lastUpdated: order.updatedAt,
+        // estimatedDuration: `${estimatedDuration}h`,
+        isOverdue,
+        hoursUntilDelivery
       },
       
-      // Progress Information
-      progress: {
-        currentStatus: order.status,
-        percentage: progressPercentage,
-        isOverdue: order.deliveryDate && order.deliveryDate < new Date() && 
-          !['DELIVERED', 'COMPLETED', 'CANCELED'].includes(order.status),
-        estimatedCompletion: order.deliveryDate
-      },
+      // Historique des activités
+      activityHistory: order.activities,
       
-      // Status Timeline
-      timeline: statusTimeline,
-      
-      // Order Notes
+      // Notes et instructions
       notes: order.notes,
       
-      // Review Information
-      review: order.reviews[0] || null,
+      // Avis client
+      customerReview: order.reviews[0] || null,
       
-      // Activity History
-      activityHistory: order.activities.map(activity => ({
-        id: activity.id,
-        type: activity.type,
-        title: activity.title,
-        description: activity.description,
-        metadata: activity.metadata,
-        timestamp: activity.createdAt
-      }))
+      // Actions possibles
+      actions: {
+        canConfirm: order.status === 'PENDING',
+        canStartProgress: order.status === 'CONFIRMED',
+        canMarkReady: order.status === 'IN_PROGRESS',
+        canDispatch: order.status === 'READY_FOR_PICKUP',
+        canDeliver: order.status === 'OUT_FOR_DELIVERY',
+        canComplete: order.status === 'DELIVERED',
+        canCancel: !['DELIVERED', 'COMPLETED', 'CANCELED'].includes(order.status),
+        needsAttention: isOverdue
+      }
     }
 
     return successResponse(orderDetails, 'Order details retrieved successfully')
@@ -229,109 +189,106 @@ export async function GET(
   }
 }
 
-// PATCH /api/admin/orders/[orderId] - Update order status
+// PATCH /api/admin/orders/[orderId] - ADMIN uniquement
 export async function PATCH(
   request: NextRequest,
   { params }: { params: { orderId: string } }
 ) {
+  const authResult = await requireOrderAccess(request, params.orderId)
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
-    const { orderId } = params
-    const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
-    
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
-    }
-
     const body = await request.json()
-    const { status, notes } = body
-
-    if (!status) {
-      return errorResponse('Status is required', 400)
+    
+    const parsed = updateOrderSchema.safeParse(body)
+    if (!parsed.success) {
+      return errorResponse('Validation error', 400)
     }
 
-    // Validate status
-    const validStatuses = [
-      'PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 
-      'OUT_FOR_DELIVERY', 'DELIVERED', 'COMPLETED', 'CANCELED'
-    ]
+    const updateData = parsed.data
 
-    if (!validStatuses.includes(status)) {
-      return errorResponse('Invalid status', 400)
-    }
-
-    // Check if order exists and belongs to this laundry
-    const existingOrder = await prisma.order.findFirst({
-      where: { 
-        id: orderId,
-        laundryId 
-      }
+    // Récupérer l'ordre actuel
+    const currentOrder = await prisma.order.findUnique({
+      where: { id: params.orderId },
+      select: { status: true, orderNumber: true }
     })
 
-    if (!existingOrder) {
-      return errorResponse('Order not found or does not belong to this laundry', 404)
+    if (!currentOrder) {
+      return errorResponse('Order not found', 404)
     }
 
-    // Update order
+    // Valider les transitions de statut
+    const validTransitions: Record<string, string[]> = {
+      'PENDING': ['CONFIRMED', 'CANCELED'],
+      'CONFIRMED': ['IN_PROGRESS', 'CANCELED'],
+      'IN_PROGRESS': ['READY_FOR_PICKUP', 'CANCELED'],
+      'READY_FOR_PICKUP': ['OUT_FOR_DELIVERY', 'CANCELED'],
+      'OUT_FOR_DELIVERY': ['DELIVERED', 'CANCELED'],
+      'DELIVERED': ['COMPLETED'],
+      'COMPLETED': [],
+      'CANCELED': []
+    }
+
+    if (updateData.status && updateData.status !== currentOrder.status) {
+      const allowedStatuses = validTransitions[currentOrder.status] || []
+      if (!allowedStatuses.includes(updateData.status)) {
+        return errorResponse(
+          `Invalid status transition from ${currentOrder.status} to ${updateData.status}`,
+          400
+        )
+      }
+    }
+
+    // Convertir les dates string en Date objects
+    const finalUpdateData: any = { ...updateData }
+    if (updateData.pickupDate) {
+      finalUpdateData.pickupDate = new Date(updateData.pickupDate)
+    }
+    if (updateData.deliveryDate) {
+      finalUpdateData.deliveryDate = new Date(updateData.deliveryDate)
+    }
+
+    // Mettre à jour la commande
     const updatedOrder = await prisma.order.update({
-      where: { id: orderId },
-      data: {
-        status,
-        notes: notes || existingOrder.notes,
-        updatedAt: new Date()
+      where: { id: params.orderId },
+      data: finalUpdateData,
+      select: {
+        id: true,
+        orderNumber: true,
+        status: true,
+        pickupDate: true,
+        deliveryDate: true,
+        notes: true,
+        updatedAt: true
       }
     })
 
-     // Map status to ActivityType
-    const getActivityType = (orderStatus: string): string => {
-      switch (orderStatus) {
-        case 'PENDING':
-          return 'ORDER_CREATED'
-        case 'CONFIRMED':
-          return 'ORDER_UPDATED'
-        case 'IN_PROGRESS':
-          return 'ORDER_UPDATED'
-        case 'READY_FOR_PICKUP':
-          return 'ORDER_UPDATED'
-        case 'OUT_FOR_DELIVERY':
-          return 'ORDER_UPDATED'
-        case 'DELIVERED':
-          return 'ORDER_COMPLETED'
-        case 'COMPLETED':
-          return 'ORDER_COMPLETED'
-        case 'CANCELED':
-          return 'ORDER_CANCELED'
-        default:
-          return 'ORDER_UPDATED'
-      }
+    // Créer une activité pour le changement de statut
+    if (updateData.status && updateData.status !== currentOrder.status) {
+      await prisma.activity.create({
+        data: {
+          type: 'ORDER_UPDATED',
+          title: `Statut mis à jour: ${updateData.status}`,
+          description: `Commande ${currentOrder.orderNumber} passée de ${currentOrder.status} à ${updateData.status}`,
+          orderId: params.orderId,
+          userId: user.sub,
+          metadata: {
+            previousStatus: currentOrder.status,
+            newStatus: updateData.status,
+            updatedBy: user.name
+          }
+        }
+      })
     }
 
-    // Create activity record for status change
-    await prisma.activity.create({
-      data: {
-        type: getActivityType(status) as any,
-        title: `Order ${status.toLowerCase().replace('_', ' ')}`,
-        description: `Order status changed to ${status}`,
-        laundryId,
-        orderId,
-        metadata: {
-          previousStatus: existingOrder.status,
-          newStatus: status,
-          updatedBy: 'admin'
-        }
-      }
-    })
-
-    return successResponse(
-      { 
-        orderId: updatedOrder.id, 
-        status: updatedOrder.status,
-        updatedAt: updatedOrder.updatedAt 
-      }, 
-      'Order status updated successfully'
-    )
+    return successResponse(updatedOrder, 'Order updated successfully')
   } catch (error) {
-    console.error('Update order status error:', error)
-    return errorResponse('Failed to update order status', 500)
+    console.error('Update order error:', error)
+    return errorResponse('Failed to update order', 500)
   }
 }

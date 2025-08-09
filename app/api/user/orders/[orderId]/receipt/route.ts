@@ -1,38 +1,37 @@
-// app/api/user/orders/[orderId]/receipt/route.ts
-import { prisma } from '@/lib/prisma'
-import { errorResponse } from '@/lib/response'
+// app/api/user/orders/[orderId]/receipt/route.ts - CUSTOMER uniquement
 import { NextRequest, NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+import { requireOrderAccess, errorResponse } from '@/lib/auth-middleware'
 
-// GET /api/user/orders/[orderId]/receipt?userId=xxx
 export async function GET(
   request: NextRequest,
   { params }: { params: { orderId: string } }
 ) {
+  const authResult = await requireOrderAccess(request, params.orderId)
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
   try {
-    const { orderId } = params
-    
-    // 🔧 FIX: Récupérer userId depuis les paramètres URL
-    const { searchParams } = new URL(request.url)
-    const userId = searchParams.get('userId')
-
-    if (!userId) {
-      return errorResponse('userId parameter is required', 400)
-    }
-
-    const order = await prisma.order.findFirst({
+    const order = await prisma.order.findUnique({
       where: { 
-        id: orderId,
-        customerId: userId,
-        status: { in: ['DELIVERED', 'COMPLETED'] } // Only allow receipt for completed orders
+        id: params.orderId,
+        status: { in: ['DELIVERED', 'COMPLETED'] } // Reçu disponible seulement pour les commandes terminées
       },
       include: {
-        customer: {
-          select: {
-            name: true,
-            email: true,
-            phone: true
+        orderItems: {
+          include: {
+            product: {
+              select: {
+                name: true,
+                category: true,
+                unit: true
+              }
+            }
           }
         },
+        address: true,
         laundry: {
           select: {
             name: true,
@@ -49,89 +48,86 @@ export async function GET(
             }
           }
         },
-        address: {
+        customer: {
           select: {
-            street: true,
-            city: true,
-            state: true,
-            zipCode: true
-          }
-        },
-        orderItems: {
-          include: {
-            product: {
-              select: {
-                name: true,
-                category: true,
-                unit: true
-              }
-            }
+            name: true,
+            email: true,
+            phone: true
           }
         }
       }
     })
 
     if (!order) {
-      return errorResponse('Order not found, does not belong to customer, or not eligible for receipt', 404)
+      return errorResponse('Receipt not available for this order', 404)
     }
 
-    // Generate receipt data
+    // Générer le reçu en format JSON (peut être converti en PDF côté client)
     const receipt = {
-      receiptNumber: `RCP-${order.orderNumber}`,
+      receiptNumber: `REC-${order.orderNumber}`,
       orderNumber: order.orderNumber,
-      orderDate: order.createdAt,
-      deliveryDate: order.deliveryDate,
+      issueDate: new Date().toISOString(),
       
-      // Customer Information
-      customer: order.customer,
-      
-      // Laundry Information
+      // Informations de la laundry
       laundry: {
         name: order.laundry.name,
         email: order.laundry.email,
         phone: order.laundry.phone,
-        address: order.laundry.addresses[0]
+        address: order.laundry.addresses[0] || null
       },
       
-      // Delivery Address
+      // Informations du client
+      customer: {
+        name: order.customer.name,
+        email: order.customer.email,
+        phone: order.customer.phone
+      },
+      
+      // Adresse de livraison
       deliveryAddress: order.address,
       
-      // Order Items
-      items: order.orderItems.map(item => ({
-        name: item.product.name,
-        category: item.product.category,
+      // Détails de la commande
+      orderDetails: {
+        orderDate: order.createdAt,
+        deliveryDate: order.deliveryDate,
+        status: order.status
+      },
+      
+      // Articles
+      items: order.orderItems.map((item, index) => ({
+        line: index + 1,
+        description: `${item.product.name} (${item.product.category})`,
         quantity: item.quantity,
         unit: item.product.unit,
         unitPrice: item.price,
         totalPrice: item.totalPrice
       })),
       
-      // Pricing
-      pricing: {
+      // Calculs
+      summary: {
         subtotal: order.totalAmount,
-        deliveryFee: order.deliveryFee,
-        discount: order.discount,
-        total: order.finalAmount
+        deliveryFee: order.deliveryFee || 0,
+        discount: order.discount || 0,
+        finalAmount: order.finalAmount,
+        paymentMethod: 'Cash on Delivery', // À adapter selon votre système de paiement
+        paymentStatus: 'Paid'
       },
       
-      // Additional Info
-      paymentMethod: 'Cash on Delivery', // TODO: Add payment method to order model
-      notes: order.notes,
-      generatedAt: new Date()
+      // Notes légales
+      footer: {
+        thankYouMessage: "Merci pour votre confiance !",
+        contactInfo: `Pour toute question, contactez-nous au ${order.laundry.phone} ou ${order.laundry.email}`,
+        generatedAt: new Date().toISOString()
+      }
     }
 
     return NextResponse.json({
       success: true,
-      message: 'Receipt retrieved successfully',
+      message: 'Receipt generated successfully',
       data: receipt
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Disposition': `attachment; filename="receipt-${order.orderNumber}.json"`
-      }
     })
   } catch (error) {
-    console.error('Get receipt error:', error)
-    return errorResponse('Failed to retrieve receipt', 500)
+    console.error('Generate receipt error:', error)
+    return errorResponse('Failed to generate receipt', 500)
   }
 }

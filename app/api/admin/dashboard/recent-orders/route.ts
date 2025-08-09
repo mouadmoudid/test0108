@@ -1,36 +1,41 @@
-// app/api/admin/dashboard/recent-orders/route.ts
+// app/api/admin/dashboard/recent-orders/route.ts - ADMIN uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { NextRequest } from 'next/server'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
+import { z } from 'zod'
+
+const recentOrdersQuerySchema = z.object({
+  limit: z.coerce.number().min(1).max(20).optional().default(5)
+})
 
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
     const { searchParams } = new URL(request.url)
-    const limit = parseInt(searchParams.get('limit') || '5')
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
+    const queryParams = Object.fromEntries(searchParams.entries())
+    
+    const parsed = recentOrdersQuerySchema.safeParse(queryParams)
+    if (!parsed.success) {
+      return errorResponse('Invalid query parameters')
     }
 
-    // Verify laundry exists
-    const laundry = await prisma.laundry.findUnique({
-      where: { id: laundryId }
-    })
+    const { limit } = parsed.data
 
-    if (!laundry) {
-      return errorResponse('Laundry not found', 404)
-    }
-
-    // Get recent orders
     const recentOrders = await prisma.order.findMany({
-      where: { laundryId },
+      where: {
+        laundryId: user.laundryId
+      },
       include: {
         customer: {
           select: {
-            id: true,
             name: true,
-            email: true,
             avatar: true
           }
         },
@@ -38,114 +43,56 @@ export async function GET(request: NextRequest) {
           include: {
             product: {
               select: {
-                id: true,
                 name: true,
                 category: true
               }
             }
-          }
-        },
-        address: {
-          select: {
-            street: true,
-            city: true,
-            state: true
-          }
+          },
+          take: 3 // Limiter à 3 produits pour l'affichage
         }
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: {
+        createdAt: 'desc'
+      },
       take: limit
     })
 
-    // Format the response
     const formattedOrders = recentOrders.map(order => {
-      // Get primary service category
-      const categories = order.orderItems.map(item => item.product.category)
-      const primaryCategory = categories[0] || 'General'
+      const primaryService = order.orderItems[0]?.product.category || 'Service général'
+      const totalItems = order.orderItems.reduce((sum: number, item: any) => sum + item.quantity, 0)
       
-      // Calculate total items
-      const totalItems = order.orderItems.reduce((sum, item) => sum + item.quantity, 0)
-      
-      // Determine urgency based on status and dates
-      let urgency = 'normal'
-      if (order.status === 'PENDING') urgency = 'high'
-      else if (['IN_PROGRESS', 'READY_FOR_PICKUP'].includes(order.status)) urgency = 'medium'
-      else if (['DELIVERED', 'COMPLETED'].includes(order.status)) urgency = 'low'
-      
+      // Calculer le temps écoulé
+      const hoursAgo = Math.floor((new Date().getTime() - order.createdAt.getTime()) / (1000 * 60 * 60))
+      const timeAgo = hoursAgo < 24 
+        ? `${hoursAgo}h` 
+        : `${Math.floor(hoursAgo / 24)}j`
+
       return {
         id: order.id,
         orderNumber: order.orderNumber,
+        status: order.status,
         customer: {
-          id: order.customer.id,
-          name: order.customer.name || order.customer.email,
-          email: order.customer.email,
+          name: order.customer.name,
           avatar: order.customer.avatar
         },
-        status: order.status,
-        urgency,
-        service: primaryCategory,
-        totalItems,
-        totalAmount: order.finalAmount,
-        deliveryAddress: {
-          street: order.address.street,
-          city: order.address.city,
-          state: order.address.state
+        service: {
+          primary: primaryService,
+          totalItems,
+          description: order.orderItems.length > 1 
+            ? `${primaryService} +${order.orderItems.length - 1} autres`
+            : primaryService
         },
-        dates: {
-          orderDate: order.createdAt,
-          pickupDate: order.pickupDate,
-          deliveryDate: order.deliveryDate
-        },
-        estimatedCompletion: order.deliveryDate || 
-          new Date(order.createdAt.getTime() + 48 * 60 * 60 * 1000), // Default 48 hours
-        isOverdue: order.deliveryDate && order.deliveryDate < new Date() && 
-          !['DELIVERED', 'COMPLETED', 'CANCELED'].includes(order.status)
+        amount: order.finalAmount,
+        timeAgo,
+        createdAt: order.createdAt,
+        priority: ['PENDING'].includes(order.status) ? 'high' : 'normal'
       }
     })
 
-    // Get summary stats for context
-    const totalActiveOrders = await prisma.order.count({
-      where: {
-        laundryId,
-        status: {
-          in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY']
-        }
-      }
-    })
-
-    const overdueOrders = await prisma.order.count({
-      where: {
-        laundryId,
-        deliveryDate: {
-          lt: new Date()
-        },
-        status: {
-          notIn: ['DELIVERED', 'COMPLETED', 'CANCELED']
-        }
-      }
-    })
-
-    const todayOrders = await prisma.order.count({
-      where: {
-        laundryId,
-        createdAt: {
-          gte: new Date(new Date().setHours(0, 0, 0, 0))
-        }
-      }
-    })
-
-    const response = {
+    return successResponse({
       orders: formattedOrders,
-      summary: {
-        totalActive: totalActiveOrders,
-        overdue: overdueOrders,
-        todayOrders,
-        showing: formattedOrders.length,
-        limit
-      }
-    }
-
-    return successResponse(response, 'Recent orders retrieved successfully')
+      count: formattedOrders.length
+    }, 'Recent orders retrieved successfully')
   } catch (error) {
     console.error('Recent orders error:', error)
     return errorResponse('Failed to retrieve recent orders', 500)

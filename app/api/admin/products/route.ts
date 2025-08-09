@@ -1,297 +1,227 @@
-// app/api/admin/products/route.ts
+// app/api/admin/products/route.ts - ADMIN uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { validateQuery } from '@/lib/validations'
-import { NextRequest } from 'next/server'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
 import { z } from 'zod'
 
-// Query schema for products list (redefined to ensure no status field)
 const productsQuerySchema = z.object({
-  page: z.coerce.number().min(1).default(1),
-  limit: z.coerce.number().min(1).max(100).default(20),
+  page: z.coerce.number().min(1).optional().default(1),
+  limit: z.coerce.number().min(1).max(100).optional().default(20),
   search: z.string().optional(),
   category: z.string().optional(),
-  sortBy: z.enum(['name', 'price', 'category', 'createdAt', 'orders', 'revenue']).default('createdAt'),
-  sortOrder: z.enum(['asc', 'desc']).default('desc')
+  status: z.enum(['ALL', 'ACTIVE', 'INACTIVE']).optional().default('ALL'),
+  sortBy: z.enum(['name', 'category', 'price', 'createdAt']).optional().default('name'),
+  sortOrder: z.enum(['asc', 'desc']).optional().default('asc')
 })
 
-// Product creation/update schema
-const productSchema = z.object({
-  name: z.string().min(1, 'Name is required'),
-  description: z.string().nullish(),
-  price: z.number().min(0, 'Price must be positive'),
-  category: z.string().nullish(),
-  unit: z.string().nullish()
+const createProductSchema = z.object({
+  name: z.string().min(1, 'Product name is required').max(100),
+  description: z.string().optional(),
+  category: z.string().min(1, 'Category is required'),
+  price: z.coerce.number().min(0, 'Price must be positive'),
+  unit: z.string().min(1, 'Unit is required'),
+  isActive: z.boolean().optional().default(true),
+  estimatedDuration: z.coerce.number().min(1).optional(), // en heures
+  specialInstructions: z.string().optional()
 })
 
+// GET /api/admin/products - ADMIN uniquement
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
     const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
-    }
-
-    // Verify laundry exists
-    const laundry = await prisma.laundry.findUnique({
-      where: { id: laundryId }
-    })
-
-    if (!laundry) {
-      return errorResponse('Laundry not found', 404)
-    }
-
-    // Validate query parameters
     const queryParams = Object.fromEntries(searchParams.entries())
-    delete queryParams.laundryId
-
-    const validatedQuery = validateQuery(productsQuerySchema, queryParams)
-    if (!validatedQuery) {
-      return errorResponse('Invalid query parameters', 400)
+    
+    const parsed = productsQuerySchema.safeParse(queryParams)
+    if (!parsed.success) {
+      return errorResponse('Invalid query parameters')
     }
 
-    const { page=1, limit=20, search, status, category, sortBy, sortOrder } = validatedQuery
+    const { page, limit, search, category, status, sortBy, sortOrder } = parsed.data
+    const offset = (page - 1) * limit
 
-    // Build where conditions
-    const whereConditions: any = {
-      laundryId
-    }
-
-    if (status) {
-      whereConditions.status = status
-    }
-
-    if (category) {
-      whereConditions.category = {
-        contains: category,
-        mode: 'insensitive'
-      }
+    // Construire les conditions de filtrage
+    const where: any = {
+      laundryId: user.laundryId
     }
 
     if (search) {
-      whereConditions.OR = [
-        {
-          name: {
-            contains: search,
-            mode: 'insensitive'
-          }
-        },
-        {
-          description: {
-            contains: search,
-            mode: 'insensitive'
-          }
-        }
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } },
+        { category: { contains: search, mode: 'insensitive' } }
       ]
     }
 
-    // Get products with order statistics
-    const products = await prisma.product.findMany({
-      where: whereConditions,
-      include: {
-        orderItems: {
-          include: {
-            order: {
-              select: {
-                status: true,
-                createdAt: true
+    if (category) {
+      where.category = category
+    }
+
+    if (status !== 'ALL') {
+      where.isActive = status === 'ACTIVE'
+    }
+
+    const [products, totalCount] = await Promise.all([
+      prisma.product.findMany({
+        where,
+        include: {
+          _count: {
+            select: {
+              orderItems: {
+                where: {
+                  order: {
+                    createdAt: {
+                      gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) // 30 derniers jours
+                    }
+                  }
+                }
               }
             }
           }
+        },
+        orderBy: {
+          [sortBy]: sortOrder
+        },
+        skip: offset,
+        take: limit
+      }),
+      prisma.product.count({ where })
+    ])
+
+    // Calculer les statistiques pour chaque produit
+    const enrichedProducts = await Promise.all(
+      products.map(async (product) => {
+        // Revenue des 30 derniers jours
+        const revenueStats = await prisma.orderItem.aggregate({
+          where: {
+            productId: product.id,
+            order: {
+              status: { in: ['DELIVERED', 'COMPLETED'] },
+              createdAt: {
+                gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+              }
+            }
+          },
+          _sum: { totalPrice: true },
+          _count: { id: true }
+        })
+
+        return {
+          id: product.id,
+          name: product.name,
+          description: product.description,
+          category: product.category,
+          price: product.price,
+          unit: product.unit,
+          isActive: product.isActive,
+          // estimatedDuration: product.estimatedDuration,
+          // specialInstructions: product.specialInstructions,
+          createdAt: product.createdAt,
+          updatedAt: product.updatedAt,
+          
+          // Statistiques
+          stats: {
+            ordersThisMonth: product._count.orderItems,
+            revenueThisMonth: revenueStats._sum.totalPrice || 0,
+            totalSold: revenueStats._count.id || 0
+          }
         }
-      }
-    })
+      })
+    )
 
-    // Calculate statistics for each product
-    const productsWithStats = products.map(product => {
-      const completedOrderItems = product.orderItems.filter(item => 
-        ['COMPLETED', 'DELIVERED'].includes(item.order.status)
-      )
-      
-      const totalQuantitySold = completedOrderItems.reduce((sum, item) => sum + item.quantity, 0)
-      const totalRevenue = completedOrderItems.reduce((sum, item) => sum + item.totalPrice, 0)
-      const totalOrders = new Set(completedOrderItems.map(item => item.orderId)).size
-      
-      // Calculate last 30 days activity
-      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
-      const recentOrderItems = completedOrderItems.filter(item => 
-        item.order.createdAt >= thirtyDaysAgo
-      )
-      const recentRevenue = recentOrderItems.reduce((sum, item) => sum + item.totalPrice, 0)
-
-      return {
-        id: product.id,
-        name: product.name,
-        description: product.description,
-        price: product.price,
-        category: product.category || 'Uncategorized',
-        unit: product.unit,
-        createdAt: product.createdAt,
-        updatedAt: product.updatedAt,
-        stats: {
-          totalQuantitySold,
-          totalRevenue,
-          totalOrders,
-          recentRevenue,
-          averageOrderValue: totalOrders > 0 ? totalRevenue / totalOrders : 0
-        }
-      }
-    })
-
-    // Sort products
-    productsWithStats.sort((a, b) => {
-      let aValue: any, bValue: any
-      
-      switch (sortBy) {
-        case 'name':
-          aValue = a.name.toLowerCase()
-          bValue = b.name.toLowerCase()
-          break
-        case 'price':
-          aValue = a.price
-          bValue = b.price
-          break
-        case 'category':
-          aValue = a.category.toLowerCase()
-          bValue = b.category.toLowerCase()
-          break
-        case 'orders':
-          aValue = a.stats.totalOrders
-          bValue = b.stats.totalOrders
-          break
-        case 'revenue':
-          aValue = a.stats.totalRevenue
-          bValue = b.stats.totalRevenue
-          break
-        case 'createdAt':
-          aValue = a.createdAt
-          bValue = b.createdAt
-          break
-        default:
-          aValue = a.createdAt
-          bValue = b.createdAt
-      }
-
-      if (sortOrder === 'asc') {
-        return aValue < bValue ? -1 : aValue > bValue ? 1 : 0
-      } else {
-        return aValue > bValue ? -1 : aValue < bValue ? 1 : 0
-      }
-    })
-
-    // Apply pagination
-    const totalCount = productsWithStats.length
-    const offset = (page - 1) * limit
-    const paginatedProducts = productsWithStats.slice(offset, offset + limit)
-
-    // Calculate pagination info
     const totalPages = Math.ceil(totalCount / limit)
-    const hasNextPage = page < totalPages
-    const hasPrevPage = page > 1
 
-    // Get summary statistics
-    const totalRevenue = productsWithStats.reduce((sum, product) => sum + product.stats.totalRevenue, 0)
-    const totalQuantitySold = productsWithStats.reduce((sum, product) => sum + product.stats.totalQuantitySold, 0)
-
-    const response = {
-      products: paginatedProducts,
+    return successResponse({
+      products: enrichedProducts,
       pagination: {
         currentPage: page,
         totalPages,
         totalCount,
-        limit,
-        hasNextPage,
-        hasPrevPage,
-        showing: paginatedProducts.length
-      },
-      summary: {
-        totalProducts: totalCount,
-        totalRevenue,
-        totalQuantitySold,
-        averagePrice: totalCount > 0 ? 
-          productsWithStats.reduce((sum, p) => sum + p.price, 0) / totalCount : 0
-      },
-      filters: {
-        search: search || null,
-        category: category || null,
-        sortBy,
-        sortOrder
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1
       }
-    }
-
-    return successResponse(response, 'Products retrieved successfully')
+    }, 'Products retrieved successfully')
   } catch (error) {
     console.error('Get products error:', error)
     return errorResponse('Failed to retrieve products', 500)
   }
 }
 
-// POST /api/admin/products
+// POST /api/admin/products - ADMIN uniquement
 export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
-    const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
-    }
-
-    // Verify laundry exists
-    const laundry = await prisma.laundry.findUnique({
-      where: { id: laundryId }
-    })
-
-    if (!laundry) {
-      return errorResponse('Laundry not found', 404)
-    }
-
     const body = await request.json()
-    const validatedData = validateQuery(productSchema, body)
     
-    if (!validatedData) {
-      return errorResponse('Invalid product data', 400)
+    const parsed = createProductSchema.safeParse(body)
+    if (!parsed.success) {
+      return errorResponse('Validation error', 400)
     }
 
-    // Check if product with same name already exists
+    const productData = parsed.data
+
+    // Vérifier que le nom du produit n'existe pas déjà pour cette laundry
     const existingProduct = await prisma.product.findFirst({
       where: {
-        laundryId,
-        name: {
-          equals: validatedData.name,
-          mode: 'insensitive'
-        }
+        name: productData.name,
+        laundryId: user.laundryId
       }
     })
 
     if (existingProduct) {
-      return errorResponse('Product with this name already exists', 400)
+      return errorResponse('A product with this name already exists', 409)
     }
 
-    // Create new product
-    const productData: any = {
-      name: validatedData.name,
-      price: validatedData.price,
-      laundryId,
-      // Set default values for required fields that might be nullable
-      unit: validatedData.unit || 'piece'
-    }
-
-    // Only add optional fields if they have actual values (not null/undefined)
-    if (validatedData.description && validatedData.description.trim() !== '') {
-      productData.description = validatedData.description
-    }
-    if (validatedData.category && validatedData.category.trim() !== '') {
-      productData.category = validatedData.category
-    }
-
+    // Créer le produit
     const newProduct = await prisma.product.create({
-      data: productData
+      data: {
+        ...productData,
+        laundryId: user.laundryId!
+      },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        category: true,
+        price: true,
+        unit: true,
+        isActive: true,
+        // estimatedDuration: true,
+        // specialInstructions: true,
+        createdAt: true
+      }
     })
 
-    // Skip activity creation for now to avoid enum errors
-    // TODO: Add activity logging once ActivityType enum is confirmed
-    
+    // Créer une activité
+    await prisma.activity.create({
+      data: {
+        type: 'PRODUCT_ADDED',
+        title: 'Nouveau produit ajouté',
+        description: `Produit "${newProduct.name}" ajouté dans la catégorie ${newProduct.category}`,
+        userId: user.sub,
+        metadata: {
+          productId: newProduct.id,
+          productName: newProduct.name,
+          category: newProduct.category,
+          price: newProduct.price
+        }
+      }
+    })
+
     return successResponse(newProduct, 'Product created successfully')
   } catch (error) {
     console.error('Create product error:', error)

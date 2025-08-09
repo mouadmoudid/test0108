@@ -1,359 +1,406 @@
-// app/api/admin/customers/[customerId]/route.ts
+// app/api/admin/customers/[customerId]/route.ts - ADMIN uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { NextRequest } from 'next/server'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
 
+// GET /api/admin/customers/[customerId] - ADMIN uniquement
 export async function GET(
   request: NextRequest,
   { params }: { params: { customerId: string } }
 ) {
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
-    const { customerId } = params
-    const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
-    }
-
-    // Get customer with comprehensive details
-    const customer = await prisma.user.findUnique({
-      where: { 
-        id: customerId,
-        role: 'CUSTOMER'
+    // Récupérer le client avec vérification qu'il appartient à la laundry de l'admin
+    const customer = await prisma.user.findFirst({
+      where: {
+        id: params.customerId,
+        role: 'CUSTOMER',
+        orders: {
+          some: {
+            laundryId: user.laundryId
+          }
+        }
       },
       include: {
+        addresses: {
+          select: {
+            id: true,
+            street: true,
+            city: true,
+            state: true,
+            zipCode: true,
+            isDefault: true,
+            createdAt: true
+          },
+          orderBy: {
+            isDefault: 'desc'
+          }
+        },
         orders: {
-          where: { laundryId },
-          include: {
-            orderItems: {
-              include: {
-                product: {
-                  select: {
-                    name: true,
-                    category: true
-                  }
-                }
+          where: {
+            laundryId: user.laundryId
+          },
+          select: {
+            id: true,
+            orderNumber: true,
+            status: true,
+            totalAmount: true,
+            finalAmount: true,
+            createdAt: true,
+            deliveryDate: true
+          },
+          orderBy: {
+            createdAt: 'desc'
+          },
+          take: 10 // Les 10 dernières commandes
+        },
+        reviews: {
+          where: {
+            order: {
+              laundryId: user.laundryId
+            }
+          },
+          select: {
+            id: true,
+            rating: true,
+            comment: true,
+            createdAt: true,
+            order: {
+              select: {
+                orderNumber: true
               }
             }
           },
-          orderBy: { createdAt: 'desc' }
-        },
-        reviews: {
-          where: { laundryId },
-          orderBy: { createdAt: 'desc' }
-        },
-        addresses: {
-          orderBy: [
-            { isDefault: 'desc' },
-            { createdAt: 'desc' }
-          ]
+          orderBy: {
+            createdAt: 'desc'
+          },
+          take: 5
         }
       }
     })
 
     if (!customer) {
-      return errorResponse('Customer not found', 404)
+      return errorResponse('Customer not found or not associated with your laundry', 404)
     }
 
-    // Verify customer has interacted with this laundry
-    if (customer.orders.length === 0) {
-      return errorResponse('Customer has no orders with this laundry', 404)
+    // Calculer les statistiques du client
+    const stats = await prisma.order.aggregate({
+      where: {
+        customerId: params.customerId,
+        laundryId: user.laundryId,
+        status: { in: ['DELIVERED', 'COMPLETED'] }
+      },
+      _count: { id: true },
+      _sum: { finalAmount: true },
+      _avg: { finalAmount: true }
+    })
+
+    // Calculer la fréquence des commandes
+    const firstOrder = await prisma.order.findFirst({
+      where: {
+        customerId: params.customerId,
+        laundryId: user.laundryId
+      },
+      orderBy: { createdAt: 'asc' },
+      select: { createdAt: true }
+    })
+
+    const lastOrder = await prisma.order.findFirst({
+      where: {
+        customerId: params.customerId,
+        laundryId: user.laundryId
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true }
+    })
+
+    // Calculer la fréquence (commandes par mois)
+    let orderFrequency = 0
+    if (firstOrder && lastOrder && stats._count.id > 1) {
+      const daysBetween = (lastOrder.createdAt.getTime() - firstOrder.createdAt.getTime()) / (1000 * 60 * 60 * 24)
+      const monthsBetween = daysBetween / 30
+      orderFrequency = monthsBetween > 0 ? Number((stats._count.id / monthsBetween).toFixed(1)) : 0
     }
 
-    // Calculate customer statistics
-    const totalOrders = customer.orders.length
-    const totalSpent = customer.orders.reduce((sum, order) => sum + order.finalAmount, 0)
-    const completedOrders = customer.orders.filter(order => 
-      ['COMPLETED', 'DELIVERED'].includes(order.status)
-    ).length
-    
-    const canceledOrders = customer.orders.filter(order => order.status === 'CANCELED').length
-    const averageOrderValue = totalOrders > 0 ? totalSpent / totalOrders : 0
-    
-    // Calculate satisfaction metrics
-    const averageRating = customer.reviews.length > 0 ? 
-      customer.reviews.reduce((sum, review) => sum + review.rating, 0) / customer.reviews.length : 0
-    
-    const lastOrder = customer.orders[0]
-    const firstOrder = customer.orders[customer.orders.length - 1]
-    
-    // Calculate customer lifetime (days since first order)
-    const customerLifetimeDays = firstOrder ? 
-      Math.floor((new Date().getTime() - firstOrder.createdAt.getTime()) / (1000 * 60 * 60 * 24)) : 0
-    
-    // Calculate order frequency (orders per month)
-    const orderFrequency = customerLifetimeDays > 0 ? (totalOrders / (customerLifetimeDays / 30)) : 0
-
-    // Determine customer segment
-    let segment: string
-    if (totalSpent >= 500 && totalOrders >= 5) {
-      segment = 'VIP'
-    } else if (totalSpent >= 200 && totalOrders >= 3) {
-      segment = 'Premium'
-    } else if (totalOrders >= 2) {
-      segment = 'Regular'
-    } else {
-      segment = 'New'
-    }
-
-    // Get service preferences (most ordered categories)
-    const servicePreferences = customer.orders.reduce((acc, order) => {
-      order.orderItems.forEach(item => {
-        const category = item.product.category || 'Other'
-        if (!acc[category]) {
-          acc[category] = { count: 0, totalSpent: 0 }
+    // Services préférés
+    const preferredServices = await prisma.orderItem.groupBy({
+      by: ['productId'],
+      where: {
+        order: {
+          customerId: params.customerId,
+          laundryId: user.laundryId
         }
-        acc[category].count += item.quantity
-        acc[category].totalSpent += item.totalPrice
-      })
-      return acc
-    }, {} as Record<string, { count: number; totalSpent: number }>)
+      },
+      _count: { id: true },
+      _sum: { quantity: true },
+      orderBy: { _count: { id: 'desc' } },
+      take: 3
+    })
 
-    const sortedPreferences = Object.entries(servicePreferences)
-      .map(([category, data]) => ({
-        category,
-        orders: data.count,
-        totalSpent: data.totalSpent,
-        percentage: (data.totalSpent / totalSpent) * 100
-      }))
-      .sort((a, b) => b.totalSpent - a.totalSpent)
+    const productIds = preferredServices.map(service => service.productId)
+    const products = await prisma.product.findMany({
+      where: { id: { in: productIds } },
+      select: { id: true, name: true, category: true }
+    })
 
-    // Calculate spending trend (last 6 months)
-    const spendingTrend = []
-    for (let i = 5; i >= 0; i--) {
-      const monthStart = new Date()
-      monthStart.setMonth(monthStart.getMonth() - i)
-      monthStart.setDate(1)
-      monthStart.setHours(0, 0, 0, 0)
-      
-      const monthEnd = new Date(monthStart)
-      monthEnd.setMonth(monthEnd.getMonth() + 1)
-      monthEnd.setDate(0)
-      monthEnd.setHours(23, 59, 59, 999)
-      
-      const monthOrders = customer.orders.filter(order => 
-        order.createdAt >= monthStart && order.createdAt <= monthEnd
-      )
-      
-      const monthSpending = monthOrders.reduce((sum, order) => sum + order.finalAmount, 0)
-      
-      spendingTrend.push({
-        month: monthStart.toLocaleDateString('en-US', { month: 'short', year: '2-digit' }),
-        spending: monthSpending,
-        orders: monthOrders.length
-      })
-    }
+    const formattedPreferredServices = preferredServices.map(service => {
+      const product = products.find(p => p.id === service.productId)
+      return {
+        serviceName: product?.name || 'Service inconnu',
+        category: product?.category || 'Catégorie inconnue',
+        orderCount: service._count.id,
+        totalQuantity: service._sum.quantity
+      }
+    })
 
-    // Customer status based on recent activity
-    const daysSinceLastOrder = lastOrder ? 
-      Math.floor((new Date().getTime() - lastOrder.createdAt.getTime()) / (1000 * 60 * 60 * 24)) : null
+    // Déterminer le segment du client
+    const totalSpent = stats._sum.finalAmount || 0
+    const orderCount = stats._count.id || 0
+    let segment = 'Nouveau'
     
-    let status: string
-    if (daysSinceLastOrder === null) {
-      status = 'new'
-    } else if (daysSinceLastOrder <= 30) {
-      status = 'active'
-    } else if (daysSinceLastOrder <= 90) {
-      status = 'dormant'
-    } else {
-      status = 'inactive'
-    }
+    if (totalSpent > 1000 && orderCount > 10) segment = 'VIP'
+    else if (totalSpent > 500 && orderCount > 5) segment = 'Régulier'
+    else if (orderCount > 2) segment = 'Fidèle'
 
-    // Format order history for display
-    const orderHistory = customer.orders.slice(0, 10).map(order => ({
-      id: order.id,
-      orderNumber: order.orderNumber,
-      status: order.status,
-      totalAmount: order.finalAmount,
-      itemCount: order.orderItems.reduce((sum, item) => sum + item.quantity, 0),
-      services: Array.from(new Set(order.orderItems.map(item => item.product.category))),
-      orderDate: order.createdAt,
-      deliveryDate: order.deliveryDate
-    }))
+    // Calculer les jours depuis la dernière commande
+    const daysSinceLastOrder = lastOrder 
+      ? Math.floor((new Date().getTime() - lastOrder.createdAt.getTime()) / (1000 * 60 * 60 * 24))
+      : null
 
-    const response = {
-      // Basic customer info
+    const customerProfile = {
+      // Informations de base
       id: customer.id,
-      name: customer.name || customer.email.split('@')[0],
+      name: customer.name,
       email: customer.email,
       phone: customer.phone,
       avatar: customer.avatar,
-      memberSince: customer.createdAt,
-      segment,
-      status,
-      
-      // Statistics
-      stats: {
-        totalOrders,
-        completedOrders,
-        canceledOrders,
-        totalSpent,
-        averageOrderValue,
-        orderFrequency: Math.round(orderFrequency * 100) / 100,
-        customerLifetimeDays,
-        averageRating: Math.round(averageRating * 10) / 10,
-        totalReviews: customer.reviews.length
+      role: customer.role,
+      createdAt: customer.createdAt,
+      suspendedAt: customer.suspendedAt,
+      suspensionReason: customer.suspensionReason,
+
+      // Statistiques
+      statistics: {
+        totalOrders: orderCount,
+        completedOrders: stats._count.id,
+        totalSpent: totalSpent,
+        averageOrderValue: stats._avg.finalAmount || 0,
+        orderFrequency, // commandes par mois
+        daysSinceLastOrder,
+        segment
       },
-      
-      // Last order info
-      lastOrder: lastOrder ? {
-        id: lastOrder.id,
-        orderNumber: lastOrder.orderNumber,
-        amount: lastOrder.finalAmount,
-        date: lastOrder.createdAt,
-        status: lastOrder.status,
-        daysSince: daysSinceLastOrder
-      } : null,
-      
-      // Service preferences
-      preferences: {
-        favoriteServices: sortedPreferences.slice(0, 5),
-        spendingDistribution: sortedPreferences
-      },
-      
-      // Trends
-      trends: {
-        spendingTrend,
-        orderFrequencyTrend: spendingTrend.map(month => ({
-          month: month.month,
-          orders: month.orders
-        }))
-      },
-      
-      // Contact information
-      addresses: customer.addresses.map(address => ({
-        id: address.id,
-        street: address.street,
-        city: address.city,
-        state: address.state,
-        zipCode: address.zipCode,
-        isDefault: address.isDefault
+
+      // Adresses
+      addresses: customer.addresses,
+
+      // Commandes récentes
+      recentOrders: customer.orders.map(order => ({
+        id: order.id,
+        orderNumber: order.orderNumber,
+        status: order.status,
+        amount: order.finalAmount,
+        orderDate: order.createdAt,
+        deliveryDate: order.deliveryDate
       })),
-      
-      // Recent order history
-      recentOrders: orderHistory,
-      
-      // Reviews
-      recentReviews: customer.reviews.slice(0, 5).map(review => ({
+
+      // Services préférés
+      preferredServices: formattedPreferredServices,
+
+      // Avis récents
+      recentReviews: customer.reviews.map(review => ({
         id: review.id,
         rating: review.rating,
         comment: review.comment,
-        createdAt: review.createdAt
-      }))
+        orderNumber: review.order?.orderNumber || 'N/A',
+        date: review.createdAt
+      })),
+
+      // Insights
+      insights: {
+        isVipCustomer: segment === 'VIP',
+        isAtRisk: daysSinceLastOrder !== null && daysSinceLastOrder > 60,
+        needsAttention: customer.suspendedAt !== null,
+        loyaltyScore: Math.min(100, Math.round((orderCount * 10) + (totalSpent / 100)))
+      }
     }
 
-    return successResponse(response, 'Customer details retrieved successfully')
-  } catch (error: any) {
-    console.error('Get customer details error:', error)
-    return errorResponse('Failed to retrieve customer details', 500)
+    return successResponse(customerProfile, 'Customer profile retrieved successfully')
+  } catch (error) {
+    console.error('Get customer profile error:', error)
+    return errorResponse('Failed to retrieve customer profile', 500)
   }
 }
 
-// DELETE /api/admin/customers/[customerId]
+// DELETE /api/admin/customers/[customerId] - ADMIN uniquement
 export async function DELETE(
   request: NextRequest,
   { params }: { params: { customerId: string } }
 ) {
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
-    const { customerId } = params
-    const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
-    }
-
-    // Check if customer exists
-    const customer = await prisma.user.findUnique({
-      where: { 
-        id: customerId,
-        role: 'CUSTOMER'
+    // Vérifier que le client existe et appartient à la laundry de l'admin
+    const customer = await prisma.user.findFirst({
+      where: {
+        id: params.customerId,
+        role: 'CUSTOMER',
+        orders: {
+          some: {
+            laundryId: user.laundryId
+          }
+        }
       },
       include: {
         orders: {
-          where: { 
-            laundryId,
+          where: {
+            laundryId: user.laundryId,
             status: {
               in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY']
             }
-          }
+          },
+          select: { id: true, orderNumber: true, status: true }
         }
       }
     })
 
     if (!customer) {
-      return errorResponse('Customer not found', 404)
+      return errorResponse('Customer not found or not associated with your laundry', 404)
     }
 
-    // Check if customer has active orders
+    // Vérifier qu'il n'y a pas de commandes actives
     if (customer.orders.length > 0) {
-      return errorResponse('Cannot delete customer with active orders. Please complete or cancel active orders first.', 400)
+      return errorResponse(
+        `Cannot delete customer: ${customer.orders.length} active order(s) found. Please complete or cancel active orders first.`,
+        400
+      )
     }
 
-    // OPTION 1: Soft delete - Keep customer but mark as deleted
-    // This preserves order history and referential integrity
-    const updatedCustomer = await prisma.user.update({
-      where: { id: customerId },
+    // Suspendre le client au lieu de le supprimer (soft delete)
+    const suspendedCustomer = await prisma.user.update({
+      where: { id: params.customerId },
       data: {
-        name: `${customer.name || 'Customer'} (Deleted)`,
-        email: `deleted_${Date.now()}_${customer.email}`, // Prevent email conflicts
-        phone: null // Clear personal data
+        suspendedAt: new Date(),
+        suspensionReason: `Account suspended by admin from laundry ${user.laundryId}`
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        suspendedAt: true
       }
     })
 
-    // Create activity log
-    try {
-      await prisma.activity.create({
-        data: {
-          type: 'ORDER_CANCELED' as any, // Using existing type
-          title: 'Customer account deleted',
-          description: `Customer account for ${customer.name || customer.email} was deleted`,
-          laundryId,
-          userId: customerId,
-          metadata: {
-            deletedBy: 'admin',
-            originalEmail: customer.email,
-            originalName: customer.name,
-            action: 'CUSTOMER_DELETED'
-          }
+    // Créer une activité
+    await prisma.activity.create({
+      data: {
+        type: 'USER_SUSPENDED',
+        title: 'Client suspendu',
+        description: `Client ${customer.name} (${customer.email}) suspendu par l'admin`,
+        userId: user.sub,
+        metadata: {
+          suspendedUserId: params.customerId,
+          reason: 'Admin action'
         }
-      })
-    } catch (activityError) {
-      console.error('Activity logging failed:', activityError)
-    }
-
-    return successResponse(
-      { 
-        customerId, 
-        deleted: true, 
-        method: 'soft_delete',
-        message: 'Customer account marked as deleted while preserving order history'
-      }, 
-      'Customer deleted successfully'
-    )
-
-    // OPTION 2: Hard delete (uncomment if you want complete removal)
-    // WARNING: This will break referential integrity if customer has orders
-    /*
-    await prisma.user.delete({
-      where: { id: customerId }
+      }
     })
 
-    return successResponse(
-      { customerId, deleted: true, method: 'hard_delete' }, 
-      'Customer permanently deleted'
-    )
-    */
+    return successResponse({
+      customerId: suspendedCustomer.id,
+      name: suspendedCustomer.name,
+      email: suspendedCustomer.email,
+      suspendedAt: suspendedCustomer.suspendedAt,
+      action: 'suspended'
+    }, 'Customer suspended successfully')
+  } catch (error) {
+    console.error('Suspend customer error:', error)
+    return errorResponse('Failed to suspend customer', 500)
+  }
+}
 
-  } catch (error: any) {
-    console.error('Delete customer error:', error)
-    
-    // Handle foreign key constraint errors
-    if (error?.code === 'P2003') {
-      return errorResponse('Cannot delete customer due to existing references (orders, reviews, etc.). Use soft delete instead.', 400)
+// PATCH /api/admin/customers/[customerId] - ADMIN uniquement pour réactiver un client
+export async function PATCH(
+  request: NextRequest,
+  { params }: { params: { customerId: string } }
+) {
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
+  try {
+    const body = await request.json()
+    const { action } = body
+
+    if (action !== 'reactivate') {
+      return errorResponse('Only reactivation action is supported', 400)
     }
-    
-    return errorResponse('Failed to delete customer', 500)
+
+    // Vérifier que le client existe
+    const customer = await prisma.user.findFirst({
+      where: {
+        id: params.customerId,
+        role: 'CUSTOMER',
+        suspendedAt: { not: null }
+      }
+    })
+
+    if (!customer) {
+      return errorResponse('Customer not found or not suspended', 404)
+    }
+
+    // Réactiver le client
+    const reactivatedCustomer = await prisma.user.update({
+      where: { id: params.customerId },
+      data: {
+        suspendedAt: null,
+        suspensionReason: null
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        suspendedAt: true
+      }
+    })
+
+    // Créer une activité
+    await prisma.activity.create({
+      data: {
+        type: 'USER_REACTIVATED',
+        title: 'Client réactivé',
+        description: `Client ${customer.name} (${customer.email}) réactivé par l'admin`,
+        userId: user.sub,
+        metadata: {
+          reactivatedUserId: params.customerId
+        }
+      }
+    })
+
+    return successResponse({
+      customerId: reactivatedCustomer.id,
+      name: reactivatedCustomer.name,
+      email: reactivatedCustomer.email,
+      suspendedAt: reactivatedCustomer.suspendedAt,
+      action: 'reactivated'
+    }, 'Customer reactivated successfully')
+  } catch (error) {
+    console.error('Reactivate customer error:', error)
+    return errorResponse('Failed to reactivate customer', 500)
   }
 }

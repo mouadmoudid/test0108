@@ -1,181 +1,293 @@
-// app/api/admin/dashboard/overview/route.ts
+// app/api/admin/dashboard/overview/route.ts - ADMIN uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { NextRequest,NextResponse } from 'next/server'
-import { requireRole } from '@/lib/auth-middleware'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
+import { z } from 'zod'
 
+const querySchema = z.object({
+  timeframe: z.enum(['week', 'month', 'quarter', 'year']).optional().default('month')
+})
 
 export async function GET(request: NextRequest) {
-  // Vérifier que l'utilisateur est ADMIN ou SUPER_ADMIN
-  const authResult = await requireRole(request, ['ADMIN', 'SUPER_ADMIN'])
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
   
   if (authResult instanceof NextResponse) {
-    return authResult // Erreur d'authentification ou d'autorisation
+    return authResult
   }
 
   const { user } = authResult
+
   try {
     const { searchParams } = new URL(request.url)
-    const timeframe = searchParams.get('timeframe') || 'week'
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
+    const queryParams = Object.fromEntries(searchParams.entries())
+    
+    const parsed = querySchema.safeParse(queryParams)
+    if (!parsed.success) {
+      return errorResponse('Invalid query parameters')
     }
 
-    // Verify laundry exists
-    const laundry = await prisma.laundry.findUnique({
-      where: { id: laundryId }
-    })
+    const { timeframe } = parsed.data
 
-    if (!laundry) {
-      return errorResponse('Laundry not found', 404)
-    }
-
-    // Calculate date range based on timeframe
+    // Calculer les dates pour la période
     const now = new Date()
     let startDate: Date
-    
+    let previousStartDate: Date
+
     switch (timeframe) {
       case 'week':
         startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+        previousStartDate = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000)
         break
-      case 'month':
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
+      case 'quarter':
+        startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000)
+        previousStartDate = new Date(now.getTime() - 180 * 24 * 60 * 60 * 1000)
         break
       case 'year':
         startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000)
+        previousStartDate = new Date(now.getTime() - 730 * 24 * 60 * 60 * 1000)
         break
-      default:
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+      default: // month
+        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
+        previousStartDate = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000)
     }
 
-    // Get orders for the timeframe
-    const ordersInPeriod = await prisma.order.findMany({
-      where: {
-        laundryId,
-        createdAt: {
-          gte: startDate
-        }
-      },
-      include: {
-        orderItems: true
-      }
-    })
-
-    // Calculate key metrics
-    const totalOrders = ordersInPeriod.length
-    const totalRevenue = ordersInPeriod.reduce((sum, order) => sum + order.finalAmount, 0)
-    const completedOrders = ordersInPeriod.filter(order => 
-      ['COMPLETED', 'DELIVERED'].includes(order.status)
-    ).length
-    
-    const pendingOrders = ordersInPeriod.filter(order => 
-      ['PENDING', 'CONFIRMED', 'IN_PROGRESS'].includes(order.status)
-    ).length
-
-    const averageOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0
-
-    // Get all-time stats for comparison
-    const allTimeStats = await prisma.order.aggregate({
-      where: { laundryId },
-      _sum: { finalAmount: true },
-      _count: { id: true }
-    })
-
-    // Generate chart data for orders over time
-    const ordersChartData = []
-    const weeklyOrdersData = []
-    
-    if (timeframe === 'week') {
-      // Daily data for week view
-      for (let i = 6; i >= 0; i--) {
-        const date = new Date(now.getTime() - i * 24 * 60 * 60 * 1000)
-        const dayStart = new Date(date.setHours(0, 0, 0, 0))
-        const dayEnd = new Date(date.setHours(23, 59, 59, 999))
-        
-        const dayOrders = ordersInPeriod.filter(order => 
-          order.createdAt >= dayStart && order.createdAt <= dayEnd
-        )
-        
-        ordersChartData.push({
-          date: dayStart.toISOString().split('T')[0],
-          orders: dayOrders.length,
-          revenue: dayOrders.reduce((sum, order) => sum + order.finalAmount, 0)
-        })
-      }
-    } else if (timeframe === 'month') {
-      // Weekly data for month view
-      for (let i = 3; i >= 0; i--) {
-        const weekStart = new Date(now.getTime() - (i + 1) * 7 * 24 * 60 * 60 * 1000)
-        const weekEnd = new Date(now.getTime() - i * 7 * 24 * 60 * 60 * 1000)
-        
-        const weekOrders = ordersInPeriod.filter(order => 
-          order.createdAt >= weekStart && order.createdAt <= weekEnd
-        )
-        
-        ordersChartData.push({
-          date: `Week ${4 - i}`,
-          orders: weekOrders.length,
-          revenue: weekOrders.reduce((sum, order) => sum + order.finalAmount, 0)
-        })
-      }
-    }
-
-    // Weekly orders data (last 8 weeks)
-    for (let i = 7; i >= 0; i--) {
-      const weekStart = new Date(now.getTime() - (i + 1) * 7 * 24 * 60 * 60 * 1000)
-      const weekEnd = new Date(now.getTime() - i * 7 * 24 * 60 * 60 * 1000)
-      
-      const weekOrders = await prisma.order.findMany({
+    // Requêtes pour les métriques actuelles
+    const [
+      totalOrders,
+      completedOrders,
+      totalRevenue,
+      pendingOrders,
+      totalCustomers,
+      activeCustomers
+    ] = await Promise.all([
+      // Total commandes de la période
+      prisma.order.count({
         where: {
-          laundryId,
-          createdAt: {
-            gte: weekStart,
-            lte: weekEnd
+          laundryId: user.laundryId,
+          createdAt: { gte: startDate }
+        }
+      }),
+      
+      // Commandes terminées
+      prisma.order.count({
+        where: {
+          laundryId: user.laundryId,
+          status: { in: ['DELIVERED', 'COMPLETED'] },
+          createdAt: { gte: startDate }
+        }
+      }),
+      
+      // Chiffre d'affaires
+      prisma.order.aggregate({
+        where: {
+          laundryId: user.laundryId,
+          status: { in: ['DELIVERED', 'COMPLETED'] },
+          createdAt: { gte: startDate }
+        },
+        _sum: { finalAmount: true }
+      }),
+      
+      // Commandes en attente
+      prisma.order.count({
+        where: {
+          laundryId: user.laundryId,
+          status: 'PENDING'
+        }
+      }),
+      
+      // Total clients (ayant passé au moins une commande)
+      prisma.user.count({
+        where: {
+          role: 'CUSTOMER',
+          orders: {
+            some: {
+              laundryId: user.laundryId
+            }
+          }
+        }
+      }),
+      
+      // Clients actifs (ayant commandé dans la période)
+      prisma.user.count({
+        where: {
+          role: 'CUSTOMER',
+          orders: {
+            some: {
+              laundryId: user.laundryId,
+              createdAt: { gte: startDate }
+            }
           }
         }
       })
+    ])
+
+    // Requêtes pour la période précédente (pour calculer les pourcentages)
+    const [
+      previousTotalOrders,
+      previousRevenue,
+      previousCustomers
+    ] = await Promise.all([
+      prisma.order.count({
+        where: {
+          laundryId: user.laundryId,
+          createdAt: { 
+            gte: previousStartDate,
+            lt: startDate 
+          }
+        }
+      }),
       
-      weeklyOrdersData.push({
-        week: `W${8 - i}`,
-        orders: weekOrders.length,
-        revenue: weekOrders.reduce((sum, order) => sum + order.finalAmount, 0)
+      prisma.order.aggregate({
+        where: {
+          laundryId: user.laundryId,
+          status: { in: ['DELIVERED', 'COMPLETED'] },
+          createdAt: { 
+            gte: previousStartDate,
+            lt: startDate 
+          }
+        },
+        _sum: { finalAmount: true }
+      }),
+      
+      prisma.user.count({
+        where: {
+          role: 'CUSTOMER',
+          orders: {
+            some: {
+              laundryId: user.laundryId,
+              createdAt: { 
+                gte: previousStartDate,
+                lt: startDate 
+              }
+            }
+          }
+        }
       })
+    ])
+
+    // Calculer les pourcentages de changement
+    const calculateGrowth = (current: number, previous: number) => {
+      if (previous === 0) return current > 0 ? 100 : 0
+      return Number(((current - previous) / previous * 100).toFixed(1))
     }
 
-    const response = {
-      // Key metrics
+    // Données pour les graphiques - Commandes par jour
+    const dailyOrders = await prisma.order.groupBy({
+      by: ['createdAt'],
+      where: {
+        laundryId: user.laundryId,
+        createdAt: { gte: startDate }
+      },
+      _count: { id: true },
+      orderBy: { createdAt: 'asc' }
+    })
+
+    // Données pour les graphiques - Revenus par semaine
+    const weeklyRevenue = await prisma.order.groupBy({
+      by: ['createdAt'],
+      where: {
+        laundryId: user.laundryId,
+        status: { in: ['DELIVERED', 'COMPLETED'] },
+        createdAt: { gte: startDate }
+      },
+      _sum: { finalAmount: true },
+      orderBy: { createdAt: 'asc' }
+    })
+
+    // Services les plus populaires
+    const popularServices = await prisma.orderItem.groupBy({
+      by: ['productId'],
+      where: {
+        order: {
+          laundryId: user.laundryId,
+          createdAt: { gte: startDate }
+        }
+      },
+      _count: { id: true },
+      _sum: { quantity: true },
+      orderBy: { _count: { id: 'desc' } },
+      take: 5
+    })
+
+    // Récupérer les détails des produits populaires
+    const productIds = popularServices.map(service => service.productId)
+    const products = await prisma.product.findMany({
+      where: { id: { in: productIds } },
+      select: { id: true, name: true, category: true }
+    })
+
+    const formattedPopularServices = popularServices.map(service => {
+      const product = products.find(p => p.id === service.productId)
+      return {
+        productId: service.productId,
+        productName: product?.name || 'Unknown',
+        category: product?.category || 'Unknown',
+        orderCount: service._count.id,
+        totalQuantity: service._sum.quantity
+      }
+    })
+
+    const overview = {
+      // Métriques principales
       metrics: {
-        totalOrders,
-        totalRevenue,
-        completedOrders,
-        pendingOrders,
-        averageOrderValue,
-        allTimeOrders: allTimeStats._count.id || 0,
-        allTimeRevenue: allTimeStats._sum.finalAmount || 0
+        totalOrders: {
+          value: totalOrders,
+          growth: calculateGrowth(totalOrders, previousTotalOrders),
+          label: `Commandes (${timeframe})`
+        },
+        completedOrders: {
+          value: completedOrders,
+          percentage: totalOrders > 0 ? Math.round((completedOrders / totalOrders) * 100) : 0,
+          label: 'Commandes terminées'
+        },
+        totalRevenue: {
+          value: totalRevenue._sum.finalAmount || 0,
+          growth: calculateGrowth(
+            totalRevenue._sum.finalAmount || 0,
+            previousRevenue._sum.finalAmount || 0
+          ),
+          label: `Chiffre d'affaires (${timeframe})`
+        },
+        pendingOrders: {
+          value: pendingOrders,
+          label: 'Commandes en attente'
+        },
+        totalCustomers: {
+          value: totalCustomers,
+          label: 'Total clients'
+        },
+        activeCustomers: {
+          value: activeCustomers,
+          growth: calculateGrowth(activeCustomers, previousCustomers),
+          label: `Clients actifs (${timeframe})`
+        }
       },
-      
-      // Chart data
+
+      // Données pour les graphiques
       charts: {
-        orders: ordersChartData,
-        weeklyOrders: weeklyOrdersData
+        ordersTimeline: dailyOrders.map(order => ({
+          date: order.createdAt,
+          orders: order._count.id
+        })),
+        revenueTimeline: weeklyRevenue.map(revenue => ({
+          date: revenue.createdAt,
+          revenue: revenue._sum.finalAmount || 0
+        })),
+        popularServices: formattedPopularServices
       },
-      
-      // Period info
-      period: {
+
+      // Informations contextuelles
+      context: {
         timeframe,
-        startDate: startDate.toISOString(),
-        endDate: now.toISOString()
+        periodStart: startDate,
+        periodEnd: now,
+        laundryId: user.laundryId
       }
     }
 
-    return successResponse(response, 'Dashboard overview retrieved successfully')
+    return successResponse(overview, 'Dashboard overview retrieved successfully')
   } catch (error) {
     console.error('Dashboard overview error:', error)
-    return NextResponse.json(
-      { success: false, message: 'Internal server error' },
-      { status: 500 }
-    )  }
+    return errorResponse('Failed to retrieve dashboard overview', 500)
+  }
 }
-

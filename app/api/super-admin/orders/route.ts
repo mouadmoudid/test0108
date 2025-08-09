@@ -1,213 +1,180 @@
-import { prisma } from '@/lib/prisma'
-import { errorResponse } from '@/lib/response'
-import { orderQuerySchema, validateQuery } from '@/lib/validations'
+// app/api/super-admin/orders/route.ts - SUPER_ADMIN uniquement
 import { NextRequest, NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
+import { z } from 'zod'
 
-// GET /api/admin/orders
+const superAdminOrdersQuerySchema = z.object({
+  page: z.coerce.number().min(1).optional().default(1),
+  limit: z.coerce.number().min(1).max(100).optional().default(20),
+  search: z.string().optional(),
+  status: z.string().optional(),
+  laundryId: z.string().optional(),
+  sortBy: z.enum(['createdAt', 'finalAmount', 'status']).optional().default('createdAt'),
+  sortOrder: z.enum(['asc', 'desc']).optional().default('desc')
+})
+
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, ['SUPER_ADMIN'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
   try {
     const { searchParams } = new URL(request.url)
     const queryParams = Object.fromEntries(searchParams.entries())
     
-    const validatedQuery = validateQuery(orderQuerySchema, queryParams)
-    if (!validatedQuery) {
-      return errorResponse('Invalid query parameters', 400)
+    const parsed = superAdminOrdersQuerySchema.safeParse(queryParams)
+    if (!parsed.success) {
+      return errorResponse('Invalid query parameters')
     }
 
-    const { page, limit, search, status, startDate, endDate } = validatedQuery
+    const { page, limit, search, status, laundryId, sortBy, sortOrder } = parsed.data
+    const offset = (page - 1) * limit
 
-    // Calculate offset
-    const safePage = page ?? 1
-    const safeLimit = limit ?? 10
-    const offset = (safePage - 1) * safeLimit
+    // Construire les conditions de filtrage
+    const where: any = {}
 
-    // Build where clause
-    const whereClause: any = {}
-
-    // Add search filter
     if (search) {
-      whereClause.OR = [
+      where.OR = [
         { orderNumber: { contains: search, mode: 'insensitive' } },
-        { customer: { name: { contains: search, mode: 'insensitive' } } },
-        { customer: { email: { contains: search, mode: 'insensitive' } } },
+        { user: { name: { contains: search, mode: 'insensitive' } } },
         { laundry: { name: { contains: search, mode: 'insensitive' } } }
       ]
     }
 
-    // Add status filter
     if (status) {
-      whereClause.status = status
+      where.status = status
     }
 
-    // Add date range filter
-    if (startDate || endDate) {
-      whereClause.createdAt = {}
-      if (startDate) {
-        whereClause.createdAt.gte = new Date(startDate)
-      }
-      if (endDate) {
-        whereClause.createdAt.lte = new Date(endDate)
-      }
+    if (laundryId) {
+      where.laundryId = laundryId
     }
 
-    // Get orders with pagination
     const [orders, totalCount] = await Promise.all([
       prisma.order.findMany({
-        where: whereClause,
-        select: {
-          id: true,
-          orderNumber: true,
-          status: true,
-          totalAmount: true,
-          deliveryFee: true,
-          discount: true,
-          finalAmount: true,
-          notes: true,
-          pickupDate: true,
-          deliveryDate: true,
-          createdAt: true,
-          updatedAt: true,
+        where,
+        include: {
           customer: {
             select: {
               id: true,
               name: true,
               email: true,
-              phone: true,
-              avatar: true
+              phone: true
             }
           },
           laundry: {
             select: {
               id: true,
               name: true,
-              email: true,
-              phone: true,
-              logo: true,
               status: true
             }
           },
-          address: {
-            select: {
-              street: true,
-              city: true,
-              state: true,
-              zipCode: true
-            }
-          },
           orderItems: {
-            select: {
-              id: true,
-              quantity: true,
-              price: true,
-              totalPrice: true,
+            include: {
               product: {
                 select: {
                   name: true,
-                  category: true,
-                  unit: true
+                  category: true
                 }
               }
             }
           },
-          _count: {
+          address: {
             select: {
-              orderItems: true
+              city: true,
+              state: true
             }
           }
         },
-        orderBy: { createdAt: 'desc' },
+        orderBy: {
+          [sortBy]: sortOrder
+        },
         skip: offset,
-        take: limit,
+        take: limit
       }),
-
-      prisma.order.count({
-        where: whereClause
-      })
+      prisma.order.count({ where })
     ])
 
-    const totalPages = Math.ceil(totalCount / (limit ?? 1))
+    const formattedOrders = orders.map(order => {
+      const primaryService = order.orderItems[0]?.product.category || 'Service général'
+      const totalItems = order.orderItems.reduce((sum, item) => sum + item.quantity, 0)
+      
+      // Calculer si la commande est en retard
+      const isOverdue = order.deliveryDate && 
+        order.deliveryDate < new Date() && 
+        !['DELIVERED', 'COMPLETED', 'CANCELED'].includes(order.status)
 
-    // Format the response
-    const formattedOrders = orders.map(order => ({
-      id: order.id,
-      orderNumber: order.orderNumber,
-      status: order.status,
-      customer: {
-        id: order.customer.id,
-        name: order.customer.name,
-        email: order.customer.email,
-        phone: order.customer.phone,
-        avatar: order.customer.avatar
-      },
-      laundry: {
-        id: order.laundry.id,
-        name: order.laundry.name,
-        email: order.laundry.email,
-        phone: order.laundry.phone,
-        logo: order.laundry.logo,
-        status: order.laundry.status
-      },
-      address: {
-        street: order.address.street,
-        city: order.address.city,
-        state: order.address.state,
-        zipCode: order.address.zipCode
-      },
-      orderSummary: {
-        totalAmount: order.totalAmount,
-        deliveryFee: order.deliveryFee,
-        discount: order.discount,
-        finalAmount: order.finalAmount,
-        itemCount: order._count.orderItems
-      },
-      orderItems: order.orderItems.map(item => ({
-        id: item.id,
-        productName: item.product.name,
-        category: item.product.category,
-        quantity: item.quantity,
-        unit: item.product.unit,
-        price: item.price,
-        totalPrice: item.totalPrice
-      })),
-      dates: {
-        orderDate: order.createdAt,
-        pickupDate: order.pickupDate,
-        deliveryDate: order.deliveryDate,
-        lastUpdated: order.updatedAt
-      },
-      notes: order.notes
-    }))
-
-    // Get order statistics for summary
-    const orderStats = await prisma.order.groupBy({
-      by: ['status'],
-      _count: { status: true },
-      where: whereClause
+      return {
+        id: order.id,
+        orderNumber: order.orderNumber,
+        status: order.status,
+        
+        // Client
+        customer: {
+          id: order.customer.id,
+          name: order.customer.name,
+          email: order.customer.email,
+          phone: order.customer.phone
+        },
+        
+        // Laundry
+        laundry: {
+          id: order.laundry.id,
+          name: order.laundry.name,
+          status: order.laundry.status
+        },
+        
+        // Détails de la commande
+        service: {
+          primary: primaryService,
+          totalItems
+        },
+        
+        // Montants
+        pricing: {
+          totalAmount: order.totalAmount,
+          finalAmount: order.finalAmount,
+          deliveryFee: order.deliveryFee || 0
+        },
+        
+        // Localisation
+        location: {
+          city: order.address.city,
+          state: order.address.state
+        },
+        
+        // Dates
+        dates: {
+          orderDate: order.createdAt,
+          deliveryDate: order.deliveryDate,
+          lastUpdated: order.updatedAt
+        },
+        
+        // Statut
+        flags: {
+          isOverdue,
+          needsAttention: isOverdue || order.status === 'PENDING',
+          priority: isOverdue ? 'high' : 'normal'
+        }
+      }
     })
 
-    const summary = {
-      totalOrders: totalCount,
-      statusDistribution: orderStats.map(stat => ({
-        status: stat.status,
-        count: stat._count.status
-      }))
-    }
+    const totalPages = Math.ceil(totalCount / limit)
 
-    return NextResponse.json({
-      success: true,
-      message: 'Orders retrieved successfully',
-      data: formattedOrders,
+    return successResponse({
+      orders: formattedOrders,
       pagination: {
-        page,
-        limit,
-        total: totalCount,
-        totalPages
-      },
-      summary,
-      timestamp: new Date().toISOString()
-    })
+        currentPage: page,
+        totalPages,
+        totalCount,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1
+      }
+    }, 'Super admin orders retrieved successfully')
   } catch (error) {
-    console.error('Admin orders error:', error)
+    console.error('Super admin orders error:', error)
     return errorResponse('Failed to retrieve orders', 500)
   }
 }

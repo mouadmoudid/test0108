@@ -1,17 +1,17 @@
-// app/api/admin/products/overview/route.ts - ADMIN uniquement
+// app/api/admin/products/overview/route.ts - ADMIN uniquement (CORRIGÉ)
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth-middleware'
 import { prisma } from '@/lib/prisma'
 import { z } from 'zod'
 
 const querySchema = z.object({
-  timeframe: z.enum(['week', 'month', 'quarter', 'year']).optional().default('month'),
-  laundryId: z.string().min(1, 'laundryId is required')
+  timeframe: z.enum(['week', 'month', 'quarter', 'year']).optional().default('month')
+  // SUPPRIMÉ: laundryId car il vient automatiquement de l'admin connecté
 })
 
 export async function GET(request: NextRequest) {
-  // Vérifier que l'utilisateur est ADMIN UNIQUEMENT
-  const authResult = await requireRole(request, ['ADMIN'])
+  // Vérifier que l'utilisateur est ADMIN avec laundry associée
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
   
   if (authResult instanceof NextResponse) {
     return authResult // Erreur d'authentification ou d'autorisation
@@ -24,6 +24,14 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(
       { success: false, message: 'Invalid user session' },
       { status: 401 }
+    )
+  }
+
+  // Vérifier que l'admin a un laundryId
+  if (!user.laundryId) {
+    return NextResponse.json(
+      { success: false, message: 'Admin must be associated with a laundry' },
+      { status: 403 }
     )
   }
 
@@ -43,20 +51,8 @@ export async function GET(request: NextRequest) {
       )
     }
 
-    const { timeframe, laundryId } = parsed.data
-
-    // Vérifier que l'admin a accès à cette laundry
-    const adminUser = await prisma.user.findUnique({
-      where: { id: user.sub },
-      include: { laundry: true }
-    })
-
-    if (!adminUser?.laundry || adminUser.laundry.id !== laundryId) {
-      return NextResponse.json(
-        { success: false, message: 'Access denied: Admin must be associated with the specified laundry' },
-        { status: 403 }
-      )
-    }
+    const { timeframe } = parsed.data
+    const laundryId = user.laundryId // CORRECTION: Utiliser le laundryId de l'admin connecté
 
     // Calculer les dates selon le timeframe
     const now = new Date()

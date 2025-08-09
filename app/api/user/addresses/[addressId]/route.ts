@@ -1,71 +1,124 @@
-// app/api/user/addresses/[addressId]/route.ts
+// app/api/user/addresses/[addressId]/route.ts - CUSTOMER uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { validateQuery } from '@/lib/validations'
-import { NextRequest } from 'next/server'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
 import { z } from 'zod'
 
-// Address update schema
-const addressUpdateSchema = z.object({
+const updateAddressSchema = z.object({
   street: z.string().min(1).optional(),
   city: z.string().min(1).optional(),
   state: z.string().min(1).optional(),
   zipCode: z.string().min(1).optional(),
   country: z.string().optional(),
   isDefault: z.boolean().optional(),
-  latitude: z.number().optional(),
-  longitude: z.number().optional(),
+  latitude: z.number().min(-90).max(90).optional(),
+  longitude: z.number().min(-180).max(180).optional()
 })
 
-// PUT /api/user/addresses/[addressId]?userId=xxx
+// GET /api/user/addresses/[addressId] - CUSTOMER uniquement
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { addressId: string } }
+) {
+  const authResult = await requireRole(request, ['CUSTOMER'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
+  try {
+    const address = await prisma.address.findUnique({
+      where: {
+        id: params.addressId,
+        userId: user.sub // S'assurer que l'adresse appartient au client
+      },
+      select: {
+        id: true,
+        street: true,
+        city: true,
+        state: true,
+        zipCode: true,
+        country: true,
+        isDefault: true,
+        latitude: true,
+        longitude: true,
+        createdAt: true,
+        updatedAt: true,
+        _count: {
+          select: {
+            orders: true // Compter les commandes utilisant cette adresse
+          }
+        }
+      }
+    })
+
+    if (!address) {
+      return errorResponse('Address not found', 404)
+    }
+
+    return successResponse(address, 'Address retrieved successfully')
+  } catch (error) {
+    console.error('Get address error:', error)
+    return errorResponse('Failed to retrieve address', 500)
+  }
+}
+
+// PUT /api/user/addresses/[addressId] - CUSTOMER uniquement
 export async function PUT(
   request: NextRequest,
   { params }: { params: { addressId: string } }
 ) {
+  const authResult = await requireRole(request, ['CUSTOMER'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
-    const { addressId } = params
-    const { searchParams } = new URL(request.url)
-    const userId = searchParams.get('userId')
-
-    if (!userId) {
-      return errorResponse('userId parameter is required', 400)
-    }
-    
     const body = await request.json()
-    const validatedData = validateQuery(addressUpdateSchema, body)
     
-    if (!validatedData) {
-      return errorResponse('Invalid address data', 400)
+    const parsed = updateAddressSchema.safeParse(body)
+    if (!parsed.success) {
+      return errorResponse('Validation error', 400)
     }
 
-    // Check if address exists and belongs to user
-    const existingAddress = await prisma.address.findFirst({
-      where: { 
-        id: addressId,
-        userId 
+    const updateData = parsed.data
+
+    // Vérifier que l'adresse appartient au client
+    const existingAddress = await prisma.address.findUnique({
+      where: {
+        id: params.addressId,
+        userId: user.sub
       }
     })
 
     if (!existingAddress) {
-      return errorResponse('Address not found or does not belong to customer', 404)
+      return errorResponse('Address not found', 404)
     }
 
-    // If this is being set as default, unset all other default addresses
-    if (validatedData.isDefault) {
+    // Si on définit cette adresse comme par défaut, retirer le statut par défaut des autres
+    if (updateData.isDefault === true) {
       await prisma.address.updateMany({
-        where: { 
-          userId,
-          isDefault: true,
-          id: { not: addressId }
+        where: {
+          userId: user.sub,
+          id: { not: params.addressId }
         },
-        data: { isDefault: false }
+        data: {
+          isDefault: false
+        }
       })
     }
 
-    // Update address
+    // Mettre à jour l'adresse
     const updatedAddress = await prisma.address.update({
-      where: { id: addressId },
-      data: validatedData,
+      where: {
+        id: params.addressId
+      },
+      data: updateData,
       select: {
         id: true,
         street: true,
@@ -80,6 +133,16 @@ export async function PUT(
       }
     })
 
+    // Créer une activité
+    await prisma.activity.create({
+      data: {
+        type: 'ADDRESS_UPDATED',
+        title: 'Adresse mise à jour',
+        description: `Adresse ${updatedAddress.street}, ${updatedAddress.city} mise à jour`,
+        userId: user.sub
+      }
+    })
+
     return successResponse(updatedAddress, 'Address updated successfully')
   } catch (error) {
     console.error('Update address error:', error)
@@ -87,62 +150,89 @@ export async function PUT(
   }
 }
 
-// DELETE /api/user/addresses/[addressId]?userId=xxx
+// DELETE /api/user/addresses/[addressId] - CUSTOMER uniquement
 export async function DELETE(
   request: NextRequest,
   { params }: { params: { addressId: string } }
 ) {
+  const authResult = await requireRole(request, ['CUSTOMER'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
-    const { addressId } = params
-    const { searchParams } = new URL(request.url)
-    const userId = searchParams.get('userId')
-
-    if (!userId) {
-      return errorResponse('userId parameter is required', 400)
-    }
-
-    // Check if address exists and belongs to user
-    const existingAddress = await prisma.address.findFirst({
-      where: { 
-        id: addressId,
-        userId 
+    // Vérifier que l'adresse appartient au client
+    const address = await prisma.address.findUnique({
+      where: {
+        id: params.addressId,
+        userId: user.sub
+      },
+      include: {
+        _count: {
+          select: {
+            orders: true
+          }
+        }
       }
     })
 
-    if (!existingAddress) {
-      return errorResponse('Address not found or does not belong to customer', 404)
+    if (!address) {
+      return errorResponse('Address not found', 404)
     }
 
-    // Don't allow deletion if it's being used in any orders
-    const ordersUsingAddress = await prisma.order.count({
-      where: { addressId }
+    // Vérifier si l'adresse est utilisée dans des commandes actives
+    const activeOrdersCount = await prisma.order.count({
+      where: {
+        addressId: params.addressId,
+        status: {
+          in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY']
+        }
+      }
     })
 
-    if (ordersUsingAddress > 0) {
-      return errorResponse('Cannot delete address that is being used in orders', 400)
+    if (activeOrdersCount > 0) {
+      return errorResponse('Cannot delete address: it is used in active orders', 400)
     }
 
-    // Delete address
-    await prisma.address.delete({
-      where: { id: addressId }
-    })
-
-    // If deleted address was default, set another address as default
-    if (existingAddress.isDefault) {
-      const nextAddress = await prisma.address.findFirst({
-        where: { userId },
-        orderBy: { createdAt: 'desc' }
+    // Si c'est l'adresse par défaut, définir une autre adresse comme par défaut
+    if (address.isDefault) {
+      const otherAddress = await prisma.address.findFirst({
+        where: {
+          userId: user.sub,
+          id: { not: params.addressId }
+        }
       })
 
-      if (nextAddress) {
+      if (otherAddress) {
         await prisma.address.update({
-          where: { id: nextAddress.id },
+          where: { id: otherAddress.id },
           data: { isDefault: true }
         })
       }
     }
 
-    return successResponse(null, 'Address deleted successfully')
+    // Supprimer l'adresse
+    await prisma.address.delete({
+      where: { id: params.addressId }
+    })
+
+    // Créer une activité
+    await prisma.activity.create({
+      data: {
+        type: 'ADDRESS_DELETED',
+        title: 'Adresse supprimée',
+        description: `Adresse ${address.street}, ${address.city} supprimée`,
+        userId: user.sub
+      }
+    })
+
+    return successResponse(
+      { deletedAddressId: params.addressId },
+      'Address deleted successfully'
+    )
   } catch (error) {
     console.error('Delete address error:', error)
     return errorResponse('Failed to delete address', 500)

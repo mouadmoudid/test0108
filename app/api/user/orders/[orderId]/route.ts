@@ -1,66 +1,24 @@
-// app/api/user/orders/[orderId]/route.ts
+// app/api/user/orders/[orderId]/route.ts - CUSTOMER uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { NextRequest } from 'next/server'
+import { requireOrderAccess, successResponse, errorResponse } from '@/lib/auth-middleware'
 
-// GET /api/user/orders/[orderId]?userId=xxx
 export async function GET(
   request: NextRequest,
   { params }: { params: { orderId: string } }
 ) {
+  const authResult = await requireOrderAccess(request, params.orderId)
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
   try {
-    const { orderId } = params
-    
-    // 🔧 FIX: Récupérer userId depuis les paramètres URL au lieu des headers
-    const { searchParams } = new URL(request.url)
-    const userId = searchParams.get('userId')
-
-    if (!userId) {
-      return errorResponse('userId parameter is required', 400)
-    }
-
-    const order = await prisma.order.findFirst({
-      where: { 
-        id: orderId,
-        customerId: userId 
-      },
+    const order = await prisma.order.findUnique({
+      where: { id: params.orderId },
       include: {
-        laundry: {
-          select: {
-            id: true,
-            name: true,
-            logo: true,
-            phone: true,
-            email: true,
-            rating: true,
-            addresses: {
-              select: {
-                street: true,
-                city: true,
-                state: true,
-                zipCode: true
-              },
-              take: 1
-            }
-          }
-        },
-        address: {
-          select: {
-            id: true,
-            street: true,
-            city: true,
-            state: true,
-            zipCode: true,
-            latitude: true,
-            longitude: true
-          }
-        },
         orderItems: {
-          select: {
-            id: true,
-            quantity: true,
-            price: true,
-            totalPrice: true,
+          include: {
             product: {
               select: {
                 id: true,
@@ -72,6 +30,23 @@ export async function GET(
             }
           }
         },
+        address: {
+          select: {
+            street: true,
+            city: true,
+            state: true,
+            zipCode: true,
+            country: true
+          }
+        },
+        laundry: {
+          select: {
+            id: true,
+            name: true,
+            phone: true,
+            email: true
+          }
+        },
         activities: {
           select: {
             id: true,
@@ -80,10 +55,10 @@ export async function GET(
             description: true,
             createdAt: true
           },
-          where: {
-            type: { in: ['ORDER_CREATED', 'ORDER_COMPLETED', 'ORDER_CANCELED', 'ORDER_UPDATED'] }
+          orderBy: {
+            createdAt: 'desc'
           },
-          orderBy: { createdAt: 'asc' }
+          take: 10
         },
         reviews: {
           select: {
@@ -98,48 +73,49 @@ export async function GET(
     })
 
     if (!order) {
-      return errorResponse('Order not found or does not belong to customer', 404)
+      return errorResponse('Order not found', 404)
     }
 
-    // Build delivery pipeline status
-    const statusOrder = ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY', 'DELIVERED', 'COMPLETED']
-    const currentStatusIndex = statusOrder.indexOf(order.status)
-    
-    const deliveryPipeline = statusOrder.map((status, index) => ({
-      status,
-      label: status.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, l => l.toUpperCase()),
-      completed: index <= currentStatusIndex,
-      current: index === currentStatusIndex,
-      timestamp: order.activities.find(activity => 
-        activity.type === `ORDER_${status}`)?.createdAt || null
-    }))
+    // Calculer le statut de livraison
+    const deliveryStatus = {
+      canTrack: ['CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY'].includes(order.status),
+      estimatedDelivery: order.deliveryDate,
+      isCompleted: ['DELIVERED', 'COMPLETED'].includes(order.status),
+      isCancelled: order.status === 'CANCELED',
+      canReview: ['DELIVERED', 'COMPLETED'].includes(order.status) && !order.reviews.length,
+      canReorder: ['DELIVERED', 'COMPLETED'].includes(order.status)
+    }
 
-    // Format order details
+    // Calculer les totaux
+    const summary = {
+      totalItems: order.orderItems.length,
+      totalQuantity: order.orderItems.reduce((sum, item) => sum + item.quantity, 0),
+      subtotal: order.totalAmount,
+      deliveryFee: order.deliveryFee || 0,
+      discount: order.discount || 0,
+      finalAmount: order.finalAmount
+    }
+
     const orderDetails = {
-      // Basic Order Information
       id: order.id,
       orderNumber: order.orderNumber,
       status: order.status,
       
-      // Delivery Pipeline
-      deliveryPipeline,
-      currentStatus: {
-        status: order.status,
-        label: order.status.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, l => l.toUpperCase()),
-        description: getStatusDescription(order.status)
+      // Informations de base
+      dates: {
+        orderDate: order.createdAt,
+        pickupDate: order.pickupDate,
+        deliveryDate: order.deliveryDate,
+        lastUpdated: order.updatedAt
       },
       
-      // Order Summary
-      summary: {
-        totalAmount: order.totalAmount,
-        deliveryFee: order.deliveryFee,
-        discount: order.discount,
-        finalAmount: order.finalAmount,
-        itemCount: order.orderItems.length,
-        totalQuantity: order.orderItems.reduce((sum, item) => sum + item.quantity, 0)
-      },
+      // Laundry info
+      laundry: order.laundry,
       
-      // Order Items
+      // Adresse de livraison
+      deliveryAddress: order.address,
+      
+      // Articles commandés
       items: order.orderItems.map(item => ({
         id: item.id,
         product: item.product,
@@ -148,35 +124,20 @@ export async function GET(
         totalPrice: item.totalPrice
       })),
       
-      // Laundry Information
-      laundry: {
-        ...order.laundry,
-        location: order.laundry.addresses[0] ? {
-          street: order.laundry.addresses[0].street,
-          city: order.laundry.addresses[0].city,
-          state: order.laundry.addresses[0].state,
-          zipCode: order.laundry.addresses[0].zipCode
-        } : null
-      },
+      // Résumé financier
+      summary,
       
-      // Delivery Information
-      deliveryAddress: order.address,
+      // Statut de livraison
+      delivery: deliveryStatus,
       
-      // Important Dates
-      dates: {
-        orderDate: order.createdAt,
-        pickupDate: order.pickupDate,
-        deliveryDate: order.deliveryDate,
-        lastUpdated: order.updatedAt
-      },
+      // Historique des activités
+      timeline: order.activities,
       
-      // Order Notes
+      // Notes
       notes: order.notes,
       
-      // Review Information
-      review: order.reviews[0] || null,
-      canReview: ['DELIVERED', 'COMPLETED'].includes(order.status) && !order.reviews[0],
-      canReorder: ['DELIVERED', 'COMPLETED'].includes(order.status)
+      // Avis
+      review: order.reviews[0] || null
     }
 
     return successResponse(orderDetails, 'Order details retrieved successfully')
@@ -184,23 +145,4 @@ export async function GET(
     console.error('Get order details error:', error)
     return errorResponse('Failed to retrieve order details', 500)
   }
-}
-
-// Helper function to get status descriptions
-type OrderStatus = 'PENDING' | 'CONFIRMED' | 'IN_PROGRESS' | 'READY_FOR_PICKUP' | 'OUT_FOR_DELIVERY' | 'DELIVERED' | 'COMPLETED' | 'CANCELED' | 'REFUNDED';
-
-function getStatusDescription(status: OrderStatus): string {
-  const descriptions: Record<OrderStatus, string> = {
-    'PENDING': 'Your order has been received and is waiting for confirmation',
-    'CONFIRMED': 'Your order has been confirmed and is being prepared',
-    'IN_PROGRESS': 'Your laundry is currently being processed',
-    'READY_FOR_PICKUP': 'Your laundry is ready and waiting for pickup',
-    'OUT_FOR_DELIVERY': 'Your order is on the way to your delivery address',
-    'DELIVERED': 'Your order has been delivered successfully',
-    'COMPLETED': 'Order completed',
-    'CANCELED': 'This order has been canceled',
-    'REFUNDED': 'This order has been refunded'
-  }
-  
-  return descriptions[status] || 'Status updated'
 }

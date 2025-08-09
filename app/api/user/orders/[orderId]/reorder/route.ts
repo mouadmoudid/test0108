@@ -1,30 +1,29 @@
-// app/api/user/orders/[orderId]/reorder/route.ts
+// app/api/user/orders/[orderId]/reorder/route.ts - CUSTOMER uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { NextRequest } from 'next/server'
+import { requireOrderAccess, successResponse, errorResponse } from '@/lib/auth-middleware'
 
-// POST /api/user/orders/[orderId]/reorder?userId=xxx
 export async function POST(
   request: NextRequest,
   { params }: { params: { orderId: string } }
 ) {
+  const authResult = await requireOrderAccess(request, params.orderId)
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
-    const { orderId } = params
-    
-    // 🔧 FIX: Récupérer userId depuis les paramètres URL
-    const { searchParams } = new URL(request.url)
-    const userId = searchParams.get('userId')
+    const body = await request.json()
+    const { addressId, pickupDate, deliveryDate, notes } = body
 
-    if (!userId) {
-      return errorResponse('userId parameter is required', 400)
-    }
-
-    // Get original order
-    const originalOrder = await prisma.order.findFirst({
+    // Récupérer la commande originale
+    const originalOrder = await prisma.order.findUnique({
       where: { 
-        id: orderId,
-        customerId: userId,
-        status: { in: ['DELIVERED', 'COMPLETED'] } // Only allow reorder for completed orders
+        id: params.orderId,
+        status: { in: ['DELIVERED', 'COMPLETED'] } // Peut seulement re-commander des commandes terminées
       },
       include: {
         orderItems: {
@@ -38,133 +37,96 @@ export async function POST(
               }
             }
           }
-        },
-        laundry: {
-          select: {
-            id: true,
-            status: true
-          }
-        },
-        address: {
-          select: {
-            id: true,
-            userId: true
-          }
         }
       }
     })
 
     if (!originalOrder) {
-      return errorResponse('Original order not found, does not belong to customer, or not eligible for reorder', 404)
+      return errorResponse('Original order not found or cannot be reordered', 404)
     }
 
-    // Check if laundry is still active
-    if (originalOrder.laundry.status !== 'ACTIVE') {
-      return errorResponse('Laundry is no longer active', 400)
-    }
-
-    // Check if address still belongs to user
-    if (originalOrder.address.userId !== userId) {
-      return errorResponse('Original delivery address is no longer available', 400)
-    }
-
-    // Filter out inactive products
-    const availableItems = originalOrder.orderItems.filter(item => 
-      item.product.isActive !== false // Assuming products have isActive field
-    )
-
-    if (availableItems.length === 0) {
-      return errorResponse('None of the products from the original order are currently available', 400)
-    }
-
-    // Calculate new order totals (prices might have changed)
-    let totalAmount = 0
-    const newOrderItems = availableItems.map(item => {
-      const totalPrice = item.product.price * item.quantity
-      totalAmount += totalPrice
-      
-      return {
-        productId: item.productId,
-        quantity: item.quantity,
-        price: item.product.price, // Use current price
-        totalPrice
+    // Vérifier que l'adresse appartient au client
+    const address = await prisma.address.findUnique({
+      where: {
+        id: addressId,
+        userId: user.sub
       }
     })
 
-    const deliveryFee = 15.00 // Use current delivery fee
-    const discount = 0 // TODO: Apply any applicable discounts
-    const finalAmount = totalAmount + deliveryFee - discount
+    if (!address) {
+      return errorResponse('Invalid delivery address', 400)
+    }
 
-    // Generate new order number
-    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`
+    // Filtrer les produits toujours actifs
+    const activeItems = originalOrder.orderItems.filter(item => item.product.isActive)
+    
+    if (activeItems.length === 0) {
+      return errorResponse('No active products available for reorder', 400)
+    }
 
-    // Create new order in a transaction
-    const newOrder = await prisma.$transaction(async (tx) => {
-      const order = await tx.order.create({
-        data: {
-          orderNumber,
-          customerId: userId,
-          laundryId: originalOrder.laundryId,
-          addressId: originalOrder.addressId,
-          totalAmount,
-          deliveryFee,
-          discount,
-          finalAmount,
-          status: 'PENDING',
-          notes: `Reorder of ${originalOrder.orderNumber}`
+    // Générer un nouveau numéro de commande
+    const orderCount = await prisma.order.count()
+    const orderNumber = `ORD-${String(orderCount + 1).padStart(6, '0')}`
+
+    // Calculer les totaux
+    const totalAmount = activeItems.reduce((sum, item) => sum + (item.product.price * item.quantity), 0)
+    const deliveryFee = 20 // À adapter selon votre logique
+    const finalAmount = totalAmount + deliveryFee
+
+    // Créer la nouvelle commande
+    const newOrder = await prisma.order.create({
+      data: {
+        orderNumber,
+        customerId: user.sub,
+        laundryId: originalOrder.laundryId,
+        addressId,
+        status: 'PENDING',
+        totalAmount,
+        deliveryFee,
+        finalAmount,
+        pickupDate: pickupDate ? new Date(pickupDate) : null,
+        deliveryDate: deliveryDate ? new Date(deliveryDate) : null,
+        notes: notes || `Reorder from ${originalOrder.orderNumber}`,
+        orderItems: {
+          create: activeItems.map(item => ({
+            productId: item.productId,
+            quantity: item.quantity,
+            price: item.product.price, // Utiliser le prix actuel
+            totalPrice: item.product.price * item.quantity
+          }))
         }
-      })
-
-      // Create order items
-      await tx.orderItem.createMany({
-        data: newOrderItems.map(item => ({
-          ...item,
-          orderId: order.id
-        }))
-      })
-
-      // Create activity log
-      await tx.activity.create({
-        data: {
-          type: 'ORDER_CREATED',
-          title: 'Order Created (Reorder)',
-          description: `Reorder created from order ${originalOrder.orderNumber}`,
-          orderId: order.id,
-          laundryId: originalOrder.laundryId,
-          userId
-        }
-      })
-
-      return order
-    })
-
-    // Return new order details
-    const orderWithDetails = await prisma.order.findUnique({
-      where: { id: newOrder.id },
+      },
       include: {
         orderItems: {
           include: {
             product: {
               select: {
                 name: true,
-                category: true,
-                unit: true
+                category: true
               }
             }
-          }
-        },
-        laundry: {
-          select: {
-            name: true,
-            logo: true
           }
         }
       }
     })
 
+    // Créer une activité
+    await prisma.activity.create({
+      data: {
+        type: 'ORDER_CREATED',
+        title: 'Nouvelle commande créée (Re-commande)',
+        description: `Commande ${newOrder.orderNumber} créée à partir de ${originalOrder.orderNumber}`,
+        orderId: newOrder.id,
+        userId: user.sub
+      }
+    })
+
     return successResponse({
-      ...orderWithDetails,
-      unavailableItems: originalOrder.orderItems.length - availableItems.length
+      orderId: newOrder.id,
+      orderNumber: newOrder.orderNumber,
+      totalItems: activeItems.length,
+      finalAmount: newOrder.finalAmount,
+      unavailableItems: originalOrder.orderItems.length - activeItems.length
     }, 'Order reordered successfully')
   } catch (error) {
     console.error('Reorder error:', error)

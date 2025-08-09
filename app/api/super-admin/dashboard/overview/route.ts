@@ -1,212 +1,275 @@
-// import { prisma } from '@/lib/prisma'
-// import { successResponse, errorResponse } from '@/lib/response'
-
-// export async function GET() {
-//   try {
-//     // Get current date and start of month for calculations
-//     const now = new Date()
-//     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1)
-
-//     // Parallel queries for better performance
-//     const [
-//       totalLaundries,
-//       totalUsers,
-//       totalOrders,
-//       monthlyOrders,
-//       totalRevenue,
-//       monthlyRevenue,
-//       activeLaundries,
-//       pendingOrders,
-//       completedOrders
-//     ] = await Promise.all([
-//       // Total laundries
-//       prisma.laundry.count(),
-      
-//       // Total users (customers)
-//       prisma.user.count({
-//         where: { role: 'CUSTOMER' }
-//       }),
-      
-//       // Total orders
-//       prisma.order.count(),
-      
-//       // Monthly orders
-//       prisma.order.count({
-//         where: {
-//           createdAt: {
-//             gte: startOfMonth
-//           }
-//         }
-//       }),
-      
-//       // Total revenue
-//       prisma.order.aggregate({
-//         _sum: {
-//           finalAmount: true
-//         },
-//         where: {
-//           status: {
-//             in: ['COMPLETED', 'DELIVERED']
-//           }
-//         }
-//       }),
-      
-//       // Monthly revenue
-//       prisma.order.aggregate({
-//         _sum: {
-//           finalAmount: true
-//         },
-//         where: {
-//           status: {
-//             in: ['COMPLETED', 'DELIVERED']
-//           },
-//           createdAt: {
-//             gte: startOfMonth
-//           }
-//         }
-//       }),
-      
-//       // Active laundries
-//       prisma.laundry.count({
-//         where: { status: 'ACTIVE' }
-//       }),
-      
-//       // Pending orders
-//       prisma.order.count({
-//         where: {
-//           status: {
-//             in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS']
-//           }
-//         }
-//       }),
-      
-//       // Completed orders this month
-//       prisma.order.count({
-//         where: {
-//           status: 'COMPLETED',
-//           createdAt: {
-//             gte: startOfMonth
-//           }
-//         }
-//       })
-//     ])
-
-//     // Calculate growth percentages (simplified - you might want to compare with previous month)
-//     const data = {
-//       overview: {
-//         totalLaundries,
-//         totalUsers,
-//         totalOrders,
-//         platformRevenue: totalRevenue._sum.finalAmount || 0,
-//       },
-//       monthlyStats: {
-//         monthlyOrders,
-//         monthlyRevenue: monthlyRevenue._sum.finalAmount || 0,
-//         completedOrders,
-//       },
-//       status: {
-//         activeLaundries,
-//         suspendedLaundries: totalLaundries - activeLaundries,
-//         pendingOrders,
-//       },
-//       growth: {
-//         ordersGrowth: 15.3, // This should be calculated based on previous period
-//         revenueGrowth: 23.1, // This should be calculated based on previous period
-//         userGrowth: 8.7, // This should be calculated based on previous period
-//       }
-//     }
-
-//     return successResponse(data, 'Dashboard overview retrieved successfully')
-//   } catch (error) {
-//     console.error('Dashboard overview error:', error)
-//     return errorResponse('Failed to retrieve dashboard overview', 500)
-//   }
-// }
-
 // app/api/super-admin/dashboard/overview/route.ts - SUPER_ADMIN uniquement
 import { NextRequest, NextResponse } from 'next/server'
-import { requireRole } from '@/lib/auth-middleware'
 import { prisma } from '@/lib/prisma'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
+import { z } from 'zod'
+
+const querySchema = z.object({
+  timeframe: z.enum(['week', 'month', 'quarter', 'year']).optional().default('month')
+})
 
 export async function GET(request: NextRequest) {
-  // Vérifier que l'utilisateur est SUPER_ADMIN UNIQUEMENT
   const authResult = await requireRole(request, ['SUPER_ADMIN'])
   
   if (authResult instanceof NextResponse) {
-    return authResult // Erreur d'authentification ou d'autorisation
-  }
-
-  const { user } = authResult
-
-  // Vérifier que user.sub existe
-  if (!user.sub) {
-    return NextResponse.json(
-      { success: false, message: 'Invalid user session' },
-      { status: 401 }
-    )
+    return authResult
   }
 
   try {
-    // Données globales de la plateforme pour le Super Admin
-    const totalLaundries = await prisma.laundry.count()
-    const totalUsers = await prisma.user.count()
-    const totalOrders = await prisma.order.count()
+    const { searchParams } = new URL(request.url)
+    const queryParams = Object.fromEntries(searchParams.entries())
     
-    const totalRevenue = await prisma.order.aggregate({
-      _sum: { finalAmount: true }
-    })
+    const parsed = querySchema.safeParse(queryParams)
+    if (!parsed.success) {
+      return errorResponse('Invalid query parameters')
+    }
 
-    // Statistiques par statut de laundry
-    const laundriesByStatus = await prisma.laundry.groupBy({
-      by: ['status'],
-      _count: { id: true }
-    })
+    const { timeframe } = parsed.data
+
+    // Calculer les dates pour la période
+    const now = new Date()
+    let startDate: Date
+    let previousStartDate: Date
+
+    switch (timeframe) {
+      case 'week':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+        previousStartDate = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000)
+        break
+      case 'quarter':
+        startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000)
+        previousStartDate = new Date(now.getTime() - 180 * 24 * 60 * 60 * 1000)
+        break
+      case 'year':
+        startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000)
+        previousStartDate = new Date(now.getTime() - 730 * 24 * 60 * 60 * 1000)
+        break
+      default: // month
+        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
+        previousStartDate = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000)
+    }
+
+    // Métriques globales actuelles
+    const [
+      totalLaundries,
+      activeLaundries,
+      totalUsers,
+      totalCustomers,
+      totalOrders,
+      completedOrders,
+      platformRevenue,
+      newUsersThisPeriod
+    ] = await Promise.all([
+      // Total laundries
+      prisma.laundry.count(),
+      
+      // Laundries actives
+      prisma.laundry.count({
+        where: { status: 'ACTIVE' }
+      }),
+      
+      // Total utilisateurs
+      prisma.user.count(),
+      
+      // Total clients
+      prisma.user.count({
+        where: { role: 'CUSTOMER' }
+      }),
+      
+      // Total commandes de la période
+      prisma.order.count({
+        where: { createdAt: { gte: startDate } }
+      }),
+      
+      // Commandes terminées
+      prisma.order.count({
+        where: {
+          status: { in: ['DELIVERED', 'COMPLETED'] },
+          createdAt: { gte: startDate }
+        }
+      }),
+      
+      // Chiffre d'affaires de la plateforme
+      prisma.order.aggregate({
+        where: {
+          status: { in: ['DELIVERED', 'COMPLETED'] },
+          createdAt: { gte: startDate }
+        },
+        _sum: { finalAmount: true }
+      }),
+      
+      // Nouveaux utilisateurs de la période
+      prisma.user.count({
+        where: { createdAt: { gte: startDate } }
+      })
+    ])
+
+    // Métriques de la période précédente pour comparaison
+    const [
+      previousTotalOrders,
+      previousRevenue,
+      previousNewUsers
+    ] = await Promise.all([
+      prisma.order.count({
+        where: {
+          createdAt: { 
+            gte: previousStartDate,
+            lt: startDate 
+          }
+        }
+      }),
+      
+      prisma.order.aggregate({
+        where: {
+          status: { in: ['DELIVERED', 'COMPLETED'] },
+          createdAt: { 
+            gte: previousStartDate,
+            lt: startDate 
+          }
+        },
+        _sum: { finalAmount: true }
+      }),
+      
+      prisma.user.count({
+        where: {
+          createdAt: { 
+            gte: previousStartDate,
+            lt: startDate 
+          }
+        }
+      })
+    ])
+
+    // Fonction pour calculer la croissance
+    const calculateGrowth = (current: number, previous: number) => {
+      if (previous === 0) return current > 0 ? 100 : 0
+      return Number(((current - previous) / previous * 100).toFixed(1))
+    }
 
     // Top performing laundries
     const topLaundries = await prisma.laundry.findMany({
-      select: {
-        id: true,
-        name: true,
-        totalOrders: true,
-        totalRevenue: true,
-        rating: true,
-        status: true
+      where: { status: 'ACTIVE' },
+      include: {
+        _count: {
+          select: {
+            orders: {
+              where: {
+                status: { in: ['DELIVERED', 'COMPLETED'] },
+                createdAt: { gte: startDate }
+              }
+            }
+          }
+        },
+        orders: {
+          where: {
+            status: { in: ['DELIVERED', 'COMPLETED'] },
+            createdAt: { gte: startDate }
+          },
+          select: {
+            finalAmount: true
+          }
+        }
       },
-      orderBy: { totalRevenue: 'desc' },
       take: 5
     })
 
-    const overview = {
-      platformMetrics: {
-        totalLaundries,
-        totalUsers,
-        totalOrders,
-        totalRevenue: totalRevenue._sum.finalAmount || 0
-      },
-      laundriesByStatus: laundriesByStatus.reduce((acc, item) => {
-        acc[item.status] = item._count.id
-        return acc
-      }, {} as Record<string, number>),
-      topPerformingLaundries: topLaundries,
-      lastUpdated: new Date().toISOString()
-    }
+    const formattedTopLaundries = topLaundries.map(laundry => ({
+      id: laundry.id,
+      name: laundry.name,
+      ordersCount: laundry._count.orders,
+      revenue: laundry.orders.reduce((sum, order) => sum + order.finalAmount, 0),
+      status: laundry.status
+    })).sort((a, b) => b.revenue - a.revenue)
 
-    return NextResponse.json({
-      success: true,
-      message: 'Super Admin dashboard data retrieved successfully',
-      data: overview,
-      requestedBy: {
-        userId: user.sub,
-        role: user.role,
-        email: user.email
-      }
+    // Distribution des commandes par statut
+    const orderStatusDistribution = await prisma.order.groupBy({
+      by: ['status'],
+      where: { createdAt: { gte: startDate } },
+      _count: { id: true }
     })
 
-  } catch (error) {
-    console.error('Super Admin dashboard overview error:', error)
-    return NextResponse.json(
-      { success: false, message: 'Internal server error' },
-      { status: 500 }
+    // Évolution des inscriptions
+    const userGrowth = await Promise.all(
+      Array.from({ length: 7 }, async (_, i) => {
+        const date = new Date(startDate.getTime() + (i * (now.getTime() - startDate.getTime()) / 7))
+        const nextDate = new Date(startDate.getTime() + ((i + 1) * (now.getTime() - startDate.getTime()) / 7))
+        
+        const count = await prisma.user.count({
+          where: {
+            createdAt: {
+              gte: date,
+              lt: nextDate
+            }
+          }
+        })
+        
+        return {
+          date,
+          newUsers: count
+        }
+      })
     )
+
+    const overview = {
+      // Métriques principales
+      metrics: {
+        totalLaundries: {
+          value: totalLaundries,
+          active: activeLaundries,
+          label: 'Total Laundries'
+        },
+        totalUsers: {
+          value: totalUsers,
+          customers: totalCustomers,
+          growth: calculateGrowth(newUsersThisPeriod, previousNewUsers),
+          label: `Utilisateurs (${timeframe})`
+        },
+        totalOrders: {
+          value: totalOrders,
+          completed: completedOrders,
+          completionRate: totalOrders > 0 ? Math.round((completedOrders / totalOrders) * 100) : 0,
+          growth: calculateGrowth(totalOrders, previousTotalOrders),
+          label: `Commandes (${timeframe})`
+        },
+        platformRevenue: {
+          value: platformRevenue._sum.finalAmount || 0,
+          growth: calculateGrowth(
+            platformRevenue._sum.finalAmount || 0,
+            previousRevenue._sum.finalAmount || 0
+          ),
+          label: `Revenus Plateforme (${timeframe})`
+        }
+      },
+
+      // Top performing laundries
+      topPerformingLaundries: formattedTopLaundries,
+
+      // Distribution des statuts de commandes
+      orderStatusBreakdown: orderStatusDistribution.map(status => ({
+        status: status.status,
+        count: status._count.id,
+        percentage: totalOrders > 0 ? Math.round((status._count.id / totalOrders) * 100) : 0
+      })),
+
+      // Croissance des utilisateurs
+      userGrowthTimeline: userGrowth,
+
+      // Informations contextuelles
+      context: {
+        timeframe,
+        periodStart: startDate,
+        periodEnd: now,
+        platformHealth: {
+          activeLaundriesRatio: totalLaundries > 0 ? Math.round((activeLaundries / totalLaundries) * 100) : 0,
+          averageOrdersPerLaundry: activeLaundries > 0 ? Math.round(totalOrders / activeLaundries) : 0,
+          averageRevenuePerLaundry: activeLaundries > 0 ? Math.round((platformRevenue._sum.finalAmount || 0) / activeLaundries) : 0
+        }
+      }
+    }
+
+    return successResponse(overview, 'Super admin dashboard overview retrieved successfully')
+  } catch (error) {
+    console.error('Super admin dashboard overview error:', error)
+    return errorResponse('Failed to retrieve dashboard overview', 500)
   }
 }

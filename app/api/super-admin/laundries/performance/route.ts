@@ -1,294 +1,206 @@
-// import { prisma } from '@/lib/prisma'
-// import { paginatedResponse, errorResponse } from '@/lib/response'
-// import { laundryPerformanceQuerySchema, validateQuery } from '@/lib/validations'
-// import { NextRequest } from 'next/server'
-
-// export async function GET(request: NextRequest) {
-//   try {
-//     const { searchParams } = new URL(request.url)
-//     const queryParams = Object.fromEntries(searchParams.entries())
-    
-//     const validatedQuery = validateQuery(laundryPerformanceQuerySchema, queryParams)
-//     if (!validatedQuery) {
-//       return errorResponse('Invalid query parameters', 400)
-//     }
-
-//     const { page = 1, limit = 10, sortBy = 'revenue', sortOrder } = validatedQuery
-
-//     // Calculate offset
-//     const offset = (page - 1) * limit
-
-//     // Get current month start date
-//     const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1)
-
-//     // Build orderBy clause
-//     let orderBy: any = { createdAt: 'desc' }
-//     switch (sortBy) {
-//       case 'ordersMonth':
-//         orderBy = { totalOrders: sortOrder }
-//         break
-//       case 'customers':
-//         // We'll sort by a calculated field later
-//         break
-//       case 'revenue':
-//         orderBy = { totalRevenue: sortOrder }
-//         break
-//       case 'rating':
-//         orderBy = { rating: sortOrder }
-//         break
-//     }
-
-//     // Get laundries with performance data
-//     const laundries = await prisma.laundry.findMany({
-//       select: {
-//         id: true,
-//         name: true,
-//         email: true,
-//         phone: true,
-//         logo: true,
-//         status: true,
-//         rating: true,
-//         totalReviews: true,
-//         totalOrders: true,
-//         totalRevenue: true,
-//         createdAt: true,
-//         addresses: {
-//           select: {
-//             city: true,
-//             state: true
-//           },
-//           take: 1
-//         },
-//         _count: {
-//           select: {
-//             orders: {
-//               where: {
-//                 createdAt: {
-//                   gte: startOfMonth
-//                 }
-//               }
-//             }
-//           }
-//         }
-//       },
-//       orderBy,
-//       skip: offset,
-//       take: limit,
-//     })
-
-//     // Get unique customers count for each laundry (this month)
-//     const laundriesWithCustomers = await Promise.all(
-//       laundries.map(async (laundry) => {
-//         const uniqueCustomers = await prisma.order.findMany({
-//           where: {
-//             laundryId: laundry.id,
-//             createdAt: {
-//               gte: startOfMonth
-//             }
-//           },
-//           select: {
-//             customerId: true
-//           },
-//           distinct: ['customerId']
-//         })
-
-//         // Calculate monthly revenue
-//         const monthlyRevenue = await prisma.order.aggregate({
-//           where: {
-//             laundryId: laundry.id,
-//             status: {
-//               in: ['COMPLETED', 'DELIVERED']
-//             },
-//             createdAt: {
-//               gte: startOfMonth
-//             }
-//           },
-//           _sum: {
-//             finalAmount: true
-//           }
-//         })
-
-//         return {
-//           id: laundry.id,
-//           name: laundry.name,
-//           email: laundry.email,
-//           phone: laundry.phone,
-//           logo: laundry.logo,
-//           status: laundry.status,
-//           location: laundry.addresses[0] ? `${laundry.addresses[0].city}, ${laundry.addresses[0].state}` : 'Not specified',
-//           performance: {
-//             ordersMonth: laundry._count.orders,
-//             customers: uniqueCustomers.length,
-//             revenue: monthlyRevenue._sum.finalAmount || 0,
-//             rating: laundry.rating,
-//             totalReviews: laundry.totalReviews,
-//             totalOrders: laundry.totalOrders,
-//             totalRevenue: laundry.totalRevenue
-//           },
-//           joinedAt: laundry.createdAt
-//         }
-//       })
-//     )
-
-//     // Sort by customers if requested
-//     if (sortBy === 'customers') {
-//       laundriesWithCustomers.sort((a, b) => {
-//         const comparison = a.performance.customers - b.performance.customers
-//         return sortOrder === 'asc' ? comparison : -comparison
-//       })
-//     }
-
-//     // Get total count for pagination
-//     const totalCount = await prisma.laundry.count()
-//     const totalPages = Math.ceil(totalCount / limit)
-
-//     return paginatedResponse(
-//       laundriesWithCustomers,
-//       {
-//         page,
-//         limit,
-//         total: totalCount,
-//         totalPages
-//       },
-//       'Laundries performance retrieved successfully'
-//     )
-//   } catch (error) {
-//     console.error('Laundries performance error:', error)
-//     return errorResponse('Failed to retrieve laundries performance', 500)
-//   }
-// }
-
 // app/api/super-admin/laundries/performance/route.ts - SUPER_ADMIN uniquement
 import { NextRequest, NextResponse } from 'next/server'
-import { requireRole } from '@/lib/auth-middleware'
 import { prisma } from '@/lib/prisma'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
 import { z } from 'zod'
 
-const querySchema = z.object({
+const performanceQuerySchema = z.object({
+  page: z.coerce.number().min(1).optional().default(1),
+  limit: z.coerce.number().min(1).max(50).optional().default(20),
   sortBy: z.enum(['ordersMonth', 'customers', 'revenue', 'rating']).optional().default('revenue'),
   sortOrder: z.enum(['asc', 'desc']).optional().default('desc'),
-  page: z.coerce.number().min(1).optional().default(1),
-  limit: z.coerce.number().min(1).max(100).optional().default(10)
+  status: z.enum(['ALL', 'ACTIVE', 'INACTIVE', 'SUSPENDED']).optional().default('ALL')
 })
 
 export async function GET(request: NextRequest) {
-  // Vérifier que l'utilisateur est SUPER_ADMIN UNIQUEMENT
   const authResult = await requireRole(request, ['SUPER_ADMIN'])
   
   if (authResult instanceof NextResponse) {
-    return authResult // Erreur d'authentification ou d'autorisation
+    return authResult
   }
-
-  const { user } = authResult
 
   try {
     const { searchParams } = new URL(request.url)
     const queryParams = Object.fromEntries(searchParams.entries())
     
-    const parsed = querySchema.safeParse(queryParams)
+    const parsed = performanceQuerySchema.safeParse(queryParams)
     if (!parsed.success) {
-      return NextResponse.json(
-        { 
-          success: false, 
-          message: 'Invalid query parameters', 
-          errors: parsed.error.errors 
-        },
-        { status: 400 }
-      )
+      return errorResponse('Invalid query parameters')
     }
 
-    const { sortBy, sortOrder, page, limit } = parsed.data
+    const { page, limit, sortBy, sortOrder, status } = parsed.data
+    const offset = (page - 1) * limit
 
-    // Calculer les métriques de performance pour chaque laundry
+    // Date pour le mois dernier
+    const lastMonth = new Date()
+    lastMonth.setMonth(lastMonth.getMonth() - 1)
+
+    // Conditions de filtrage
+    const where: any = {}
+    if (status !== 'ALL') {
+      where.status = status
+    }
+
     const laundries = await prisma.laundry.findMany({
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        phone: true,
-        status: true,
-        rating: true,
-        totalOrders: true,
-        totalRevenue: true,
-        totalReviews: true,
-        createdAt: true,
+      where,
+      include: {
+        admin: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true
+          }
+        },
+        orders: {
+          where: {
+            createdAt: { gte: lastMonth },
+            status: { in: ['DELIVERED', 'COMPLETED'] }
+          },
+          select: {
+            finalAmount: true,
+            customerId: true
+          }
+        },
         _count: {
           select: {
             orders: {
               where: {
-                createdAt: {
-                  gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1) // Ce mois
-                }
+                createdAt: { gte: lastMonth }
               }
             }
           }
         }
       },
-      orderBy: sortBy === 'ordersMonth' 
-        ? undefined // Will sort manually for monthly orders
-        : sortBy === 'customers'
-        ? { totalOrders: sortOrder } // Approximation
-        : sortBy === 'revenue'
-        ? { totalRevenue: sortOrder }
-        : { rating: sortOrder },
-      skip: (page - 1) * limit,
+      skip: offset,
       take: limit
     })
 
-    // Formater les données de performance
-    const performanceData = laundries.map(laundry => ({
-      id: laundry.id,
-      name: laundry.name,
-      email: laundry.email,
-      phone: laundry.phone,
-      status: laundry.status,
-      performance: {
-        ordersMonth: laundry._count.orders,
-        totalOrders: laundry.totalOrders,
-        revenue: laundry.totalRevenue,
-        rating: laundry.rating,
-        totalReviews: laundry.totalReviews,
-        memberSince: laundry.createdAt
-      }
-    }))
+    // Calculer les métriques pour chaque laundry
+    const laundriesWithMetrics = await Promise.all(
+      laundries.map(async (laundry) => {
+        // Revenus du mois
+        const monthlyRevenue = laundry.orders.reduce((sum, order) => sum + order.finalAmount, 0)
+        
+        // Clients uniques du mois
+        const uniqueCustomers = new Set(laundry.orders.map(order => order.customerId)).size
+        
+        // Total clients
+        const totalCustomers = await prisma.user.count({
+          where: {
+            role: 'CUSTOMER',
+            orders: {
+              some: {
+                laundryId: laundry.id
+              }
+            }
+          }
+        })
 
-    // Trier manuellement si nécessaire pour ordersMonth
-    if (sortBy === 'ordersMonth') {
-      performanceData.sort((a, b) => {
-        const compare = a.performance.ordersMonth - b.performance.ordersMonth
-        return sortOrder === 'desc' ? -compare : compare
-      })
-    }
+        // Rating moyen (simulation - vous devriez avoir une vraie logique de rating)
+        const averageRating = await prisma.review.aggregate({
+          where: {
+            order: {
+              laundryId: laundry.id
+            }
+          },
+          _avg: { rating: true }
+        })
 
-    const totalCount = await prisma.laundry.count()
+        // Commandes en retard
+        const overdueOrders = await prisma.order.count({
+          where: {
+            laundryId: laundry.id,
+            status: { in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY'] },
+            deliveryDate: { lt: new Date() }
+          }
+        })
 
-    return NextResponse.json({
-      success: true,
-      message: 'Laundries performance data retrieved successfully',
-      data: {
-        laundries: performanceData,
-        pagination: {
-          page,
-          limit,
-          total: totalCount,
-          totalPages: Math.ceil(totalCount / limit)
-        },
-        sortedBy: {
-          field: sortBy,
-          order: sortOrder
+        return {
+          id: laundry.id,
+          name: laundry.name,
+          email: laundry.email,
+          phone: laundry.phone,
+          status: laundry.status,
+          createdAt: laundry.createdAt,
+          
+          // Admin info
+          admin: laundry.admin,
+          
+          // Métriques de performance
+          metrics: {
+            ordersMonth: laundry._count.orders,
+            revenue: monthlyRevenue,
+            customers: totalCustomers,
+            activeCustomersMonth: uniqueCustomers,
+            rating: Number((averageRating._avg.rating || 0).toFixed(1)),
+            overdueOrders,
+            
+            // Ratios calculés
+            revenuePerOrder: laundry._count.orders > 0 ? Math.round(monthlyRevenue / laundry._count.orders) : 0,
+            revenuePerCustomer: uniqueCustomers > 0 ? Math.round(monthlyRevenue / uniqueCustomers) : 0,
+            customerRetentionRate: totalCustomers > 0 ? Math.round((uniqueCustomers / totalCustomers) * 100) : 0
+          },
+          
+          // Statut de santé
+          healthStatus: {
+            overall: overdueOrders === 0 && laundry._count.orders > 0 ? 'excellent' :
+                    overdueOrders <= 2 && laundry._count.orders > 0 ? 'good' :
+                    laundry._count.orders > 0 ? 'warning' : 'poor',
+            hasOverdueOrders: overdueOrders > 0,
+            isActive: laundry.status === 'ACTIVE',
+            needsAttention: overdueOrders > 5 || (averageRating._avg.rating || 0) < 3
+          }
         }
-      },
-      requestedBy: {
-        userId: user.sub,
-        role: user.role
+      })
+    )
+
+    // Trier selon les critères
+    laundriesWithMetrics.sort((a, b) => {
+      let aValue: number, bValue: number
+      
+      switch (sortBy) {
+        case 'ordersMonth':
+          aValue = a.metrics.ordersMonth
+          bValue = b.metrics.ordersMonth
+          break
+        case 'customers':
+          aValue = a.metrics.customers
+          bValue = b.metrics.customers
+          break
+        case 'rating':
+          aValue = a.metrics.rating
+          bValue = b.metrics.rating
+          break
+        default: // revenue
+          aValue = a.metrics.revenue
+          bValue = b.metrics.revenue
       }
+      
+      return sortOrder === 'desc' ? bValue - aValue : aValue - bValue
     })
 
+    const totalCount = await prisma.laundry.count({ where })
+    const totalPages = Math.ceil(totalCount / limit)
+
+    return successResponse({
+      laundries: laundriesWithMetrics,
+      pagination: {
+        currentPage: page,
+        totalPages,
+        totalCount,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1
+      },
+      summary: {
+        totalLaundries: totalCount,
+        activeLaundries: laundriesWithMetrics.filter(l => l.status === 'ACTIVE').length,
+        totalRevenue: laundriesWithMetrics.reduce((sum, l) => sum + l.metrics.revenue, 0),
+        averageRating: Number((laundriesWithMetrics.reduce((sum, l) => sum + l.metrics.rating, 0) / laundriesWithMetrics.length).toFixed(1)) || 0
+      }
+    }, 'Laundries performance retrieved successfully')
   } catch (error) {
-    console.error('Super Admin laundries performance error:', error)
-    return NextResponse.json(
-      { success: false, message: 'Internal server error' },
-      { status: 500 }
-    )
+    console.error('Laundries performance error:', error)
+    return errorResponse('Failed to retrieve laundries performance', 500)
   }
 }

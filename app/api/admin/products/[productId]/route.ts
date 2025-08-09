@@ -1,109 +1,274 @@
-// app/api/admin/products/[productId]/route.ts
+// app/api/admin/products/[productId]/route.ts - ADMIN uniquement (CORRIGÉ)
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { validateQuery } from '@/lib/validations'
-import { NextRequest } from 'next/server'
+import { requireRole } from '@/lib/auth-middleware'
 import { z } from 'zod'
 
-// Product update schema
-const productUpdateSchema = z.object({
-  name: z.string().min(1).optional(),
-  description: z.string().nullish(),
-  price: z.number().min(0).optional(),
-  category: z.string().nullish(),
-  unit: z.string().nullish()
+// Helpers de réponse
+const successResponse = (data: any, message: string = 'Success') => {
+  return NextResponse.json({
+    success: true,
+    message,
+    data
+  })
+}
+
+const errorResponse = (message: string, status: number = 400) => {
+  return NextResponse.json(
+    { success: false, message },
+    { status }
+  )
+}
+
+const updateProductSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  description: z.string().optional(),
+  category: z.string().min(1).optional(),
+  price: z.coerce.number().min(0).optional(),
+  unit: z.string().min(1).optional(),
+  isActive: z.boolean().optional(),
+  estimatedDuration: z.coerce.number().min(1).optional(),
+  specialInstructions: z.string().optional()
 })
 
-// PUT /api/admin/products/[productId]
+// GET /api/admin/products/[productId] - ADMIN uniquement
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { productId: string } }
+) {
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
+  try {
+    const product = await prisma.product.findFirst({
+      where: {
+        id: params.productId,
+        laundryId: user.laundryId
+      },
+      include: {
+        orderItems: {
+          include: {
+            order: {
+              select: {
+                id: true,
+                orderNumber: true,
+                status: true,
+                createdAt: true,
+                customerId: true // CORRECTION: utiliser customerId au lieu de customer relation
+              }
+            }
+          },
+          orderBy: {
+            createdAt: 'desc'
+          },
+          take: 10 // 10 dernières commandes
+        }
+      }
+    })
+
+    if (!product) {
+      return errorResponse('Product not found', 404)
+    }
+
+    // Récupérer les noms des clients séparément si nécessaire
+    const customerIdsSet = new Set(product.orderItems.map(item => item.order.customerId))
+    const customerIds = Array.from(customerIdsSet) // CORRECTION: utiliser Array.from au lieu du spread
+    const customers = await prisma.user.findMany({
+      where: { id: { in: customerIds } },
+      select: { id: true, name: true }
+    })
+
+    // Calculer les statistiques détaillées
+    const stats = await prisma.orderItem.aggregate({
+      where: {
+        productId: params.productId,
+        order: {
+          status: { in: ['DELIVERED', 'COMPLETED'] }
+        }
+      },
+      _sum: { 
+        quantity: true,
+        totalPrice: true 
+      },
+      _count: { id: true },
+      _avg: { totalPrice: true }
+    })
+
+    // Statistiques par mois (6 derniers mois)
+    const monthlyStats = await Promise.all(
+      Array.from({ length: 6 }, async (_, i) => {
+        const endDate = new Date()
+        endDate.setMonth(endDate.getMonth() - i)
+        const startDate = new Date(endDate.getFullYear(), endDate.getMonth(), 1)
+        endDate.setMonth(endDate.getMonth() + 1)
+        endDate.setDate(0) // Dernier jour du mois
+
+        const monthStats = await prisma.orderItem.aggregate({
+          where: {
+            productId: params.productId,
+            order: {
+              status: { in: ['DELIVERED', 'COMPLETED'] },
+              createdAt: {
+                gte: startDate,
+                lte: endDate
+              }
+            }
+          },
+          _sum: { 
+            quantity: true,
+            totalPrice: true 
+          },
+          _count: { id: true }
+        })
+
+        return {
+          month: startDate.toLocaleDateString('fr-FR', { month: 'short', year: 'numeric' }),
+          orders: monthStats._count.id || 0,
+          quantity: monthStats._sum.quantity || 0,
+          revenue: monthStats._sum.totalPrice || 0
+        }
+      })
+    )
+
+    const productDetails = {
+      id: product.id,
+      name: product.name,
+      description: product.description,
+      category: product.category,
+      price: product.price,
+      unit: product.unit,
+      isActive: product.isActive,
+      // estimatedDuration: product.estimatedDuration,
+      // specialInstructions: product.specialInstructions,
+      createdAt: product.createdAt,
+      updatedAt: product.updatedAt,
+      laundryId: product.laundryId,
+      
+      // Statistiques globales
+      statistics: {
+        totalOrders: stats._count.id || 0,
+        totalQuantitySold: stats._sum.quantity || 0,
+        totalRevenue: stats._sum.totalPrice || 0,
+        averageOrderValue: stats._avg.totalPrice || 0
+      },
+
+      // Évolution mensuelle
+      monthlyPerformance: monthlyStats.reverse(),
+
+      // Commandes récentes avec noms des clients
+      recentOrders: product.orderItems.map(item => {
+        const customer = customers.find(c => c.id === item.order.customerId)
+        return {
+          orderId: item.order.id,
+          orderNumber: item.order.orderNumber,
+          customerName: customer?.name || 'Client inconnu',
+          quantity: item.quantity,
+          totalPrice: item.totalPrice,
+          status: item.order.status,
+          orderDate: item.order.createdAt
+        }
+      })
+    }
+
+    return successResponse(productDetails, 'Product details retrieved successfully')
+  } catch (error) {
+    console.error('Get product details error:', error)
+    return errorResponse('Failed to retrieve product details', 500)
+  }
+}
+
+// PUT /api/admin/products/[productId] - ADMIN uniquement
 export async function PUT(
   request: NextRequest,
   { params }: { params: { productId: string } }
 ) {
-  try {
-    const { productId } = params
-    const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
 
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
+  const { user } = authResult
+
+  try {
+    const body = await request.json()
+    
+    const parsed = updateProductSchema.safeParse(body)
+    if (!parsed.success) {
+      return errorResponse('Validation error', 400)
     }
 
-    // Check if product exists and belongs to this laundry
+    const updateData = parsed.data
+
+    // Vérifier que le produit appartient à la laundry de l'admin
     const existingProduct = await prisma.product.findFirst({
-      where: { 
-        id: productId,
-        laundryId 
+      where: {
+        id: params.productId,
+        laundryId: user.laundryId
       }
     })
 
     if (!existingProduct) {
-      return errorResponse('Product not found or does not belong to this laundry', 404)
+      return errorResponse('Product not found', 404)
     }
 
-    const body = await request.json()
-    const validatedData = validateQuery(productUpdateSchema, body)
-    
-    if (!validatedData) {
-      return errorResponse('Invalid product data', 400)
-    }
-
-    // Check if updating name and it conflicts with existing product
-    if (validatedData.name && validatedData.name !== existingProduct.name) {
-      const conflictingProduct = await prisma.product.findFirst({
+    // Si le nom change, vérifier qu'il n'existe pas déjà
+    if (updateData.name && updateData.name !== existingProduct.name) {
+      const duplicateName = await prisma.product.findFirst({
         where: {
-          laundryId,
-          name: {
-            equals: validatedData.name,
-            mode: 'insensitive'
-          },
-          id: { not: productId }
+          name: updateData.name,
+          laundryId: user.laundryId,
+          id: { not: params.productId }
         }
       })
 
-      if (conflictingProduct) {
-        return errorResponse('Product with this name already exists', 400)
+      if (duplicateName) {
+        return errorResponse('A product with this name already exists', 409)
       }
     }
 
-    // Prepare update data, filtering out undefined values
-    const updateData: any = {}
-    
-    if (validatedData.name !== undefined) {
-      updateData.name = validatedData.name
-    }
-    if (validatedData.description !== undefined) {
-      updateData.description = validatedData.description
-    }
-    if (validatedData.price !== undefined) {
-      updateData.price = validatedData.price
-    }
-    if (validatedData.category !== undefined) {
-      updateData.category = validatedData.category
-    }
-    if (validatedData.unit !== undefined) {
-      updateData.unit = validatedData.unit
-    }
-
-    // Update product
+    // Mettre à jour le produit - CORRECTION: inclure tous les champs
     const updatedProduct = await prisma.product.update({
-      where: { id: productId },
-      data: updateData
-    })
-
-    // Create activity record
-    await prisma.activity.create({
-      data: {
-        type: 'PRODUCT_UPDATED',
-        title: 'Product updated',
-        description: `Product "${updatedProduct.name}" was updated`,
-        laundryId,
-        metadata: {
-          productId: updatedProduct.id,
-          productName: updatedProduct.name,
-          changes: validatedData
-        }
+      where: { id: params.productId },
+      data: updateData,
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        category: true,
+        price: true,
+        unit: true,
+        isActive: true,
+        // estimatedDuration: true, // DÉCOMMENTÉ
+        // specialInstructions: true, // DÉCOMMENTÉ
+        updatedAt: true
       }
     })
+
+    // Créer une activité (avec gestion d'erreur)
+    try {
+      await prisma.activity.create({
+        data: {
+          type: 'PRODUCT_UPDATED',
+          title: 'Produit mis à jour',
+          description: `Produit "${updatedProduct.name}" mis à jour`,
+          userId: user.sub,
+          metadata: {
+            productId: updatedProduct.id,
+            productName: updatedProduct.name,
+            changes: updateData
+          }
+        }
+      })
+    } catch (activityError) {
+      console.log('Warning: Failed to create activity:', activityError)
+      // Continue même si l'activité échoue
+    }
 
     return successResponse(updatedProduct, 'Product updated successfully')
   } catch (error) {
@@ -112,40 +277,36 @@ export async function PUT(
   }
 }
 
-// PATCH /api/admin/products/[productId] (alternative to PUT)
-export async function PATCH(
-  request: NextRequest,
-  { params }: { params: { productId: string } }
-) {
-  return PUT(request, { params })
-}
-
-// DELETE /api/admin/products/[productId]
+// DELETE /api/admin/products/[productId] - ADMIN uniquement
 export async function DELETE(
   request: NextRequest,
   { params }: { params: { productId: string } }
 ) {
+  const authResult = await requireRole(request, ['ADMIN'], { requireLaundry: true })
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
-    const { productId } = params
-    const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
-    }
-
-    // Check if product exists and belongs to this laundry
-    const existingProduct = await prisma.product.findFirst({
-      where: { 
-        id: productId,
-        laundryId 
+    // Vérifier que le produit appartient à la laundry de l'admin
+    const product = await prisma.product.findFirst({
+      where: {
+        id: params.productId,
+        laundryId: user.laundryId
       },
       include: {
-        orderItems: {
-          include: {
-            order: {
-              select: {
-                status: true
+        _count: {
+          select: {
+            orderItems: {
+              where: {
+                order: {
+                  status: {
+                    in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY']
+                  }
+                }
               }
             }
           }
@@ -153,56 +314,57 @@ export async function DELETE(
       }
     })
 
-    if (!existingProduct) {
-      return errorResponse('Product not found or does not belong to this laundry', 404)
+    if (!product) {
+      return errorResponse('Product not found', 404)
     }
 
-    // Check if product has active orders
-    const hasActiveOrders = existingProduct.orderItems.some(item => 
-      ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'READY_FOR_PICKUP', 'OUT_FOR_DELIVERY'].includes(item.order.status)
-    )
-
-    if (hasActiveOrders) {
-      return errorResponse('Cannot delete product with active orders. Please complete or cancel active orders first.', 400)
+    // Vérifier qu'il n'y a pas de commandes actives avec ce produit
+    if (product._count.orderItems > 0) {
+      return errorResponse(
+        'Cannot delete product: it is used in active orders. Please complete active orders first or mark the product as inactive.',
+        400
+      )
     }
 
-    // Instead of hard delete, we can soft delete by marking as deleted in name
-    // or we can hard delete if there are no order items at all
-    if (existingProduct.orderItems.length === 0) {
-      // Hard delete if no order history
-      await prisma.product.delete({
-        where: { id: productId }
-      })
-    } else {
-      // Soft delete by modifying the name to indicate deletion
-      await prisma.product.update({
-        where: { id: productId },
-        data: { 
-          name: `${existingProduct.name} (Deleted)`,
-          updatedAt: new Date()
-        }
-      })
-    }
-
-    // Create activity record
-    await prisma.activity.create({
-      data: {
-        type: 'PRODUCT_DELETED',
-        title: 'Product deleted',
-        description: `Product "${existingProduct.name}" was deleted`,
-        laundryId,
-        metadata: {
-          productId: existingProduct.id,
-          productName: existingProduct.name,
-          hadOrderHistory: existingProduct.orderItems.length > 0
-        }
+    // Désactiver le produit au lieu de le supprimer (soft delete recommandé)
+    const deactivatedProduct = await prisma.product.update({
+      where: { id: params.productId },
+      data: { 
+        isActive: false,
+        updatedAt: new Date()
+      },
+      select: {
+        id: true,
+        name: true,
+        isActive: true
       }
     })
 
-    return successResponse(
-      { productId, deleted: true }, 
-      'Product deleted successfully'
-    )
+    // Créer une activité (avec gestion d'erreur)
+    try {
+      await prisma.activity.create({
+        data: {
+          type: 'PRODUCT_DELETED',
+          title: 'Produit désactivé',
+          description: `Produit "${product.name}" désactivé (soft delete)`,
+          userId: user.sub,
+          metadata: {
+            productId: product.id,
+            productName: product.name
+          }
+        }
+      })
+    } catch (activityError) {
+      console.log('Warning: Failed to create activity:', activityError)
+      // Continue même si l'activité échoue
+    }
+
+    return successResponse({
+      productId: deactivatedProduct.id,
+      name: deactivatedProduct.name,
+      isActive: deactivatedProduct.isActive,
+      action: 'deactivated'
+    }, 'Product deactivated successfully')
   } catch (error) {
     console.error('Delete product error:', error)
     return errorResponse('Failed to delete product', 500)

@@ -1,129 +1,142 @@
-// app/api/user/orders/history/route.ts
+// app/api/user/orders/history/route.ts - CUSTOMER uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { paginatedResponse, errorResponse } from '@/lib/response'
-import { orderQuerySchema, validateQuery } from '@/lib/validations'
-import { NextRequest } from 'next/server'
+import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
+import { z } from 'zod'
 
-// GET /api/user/orders/history?userId=xxx&page=1&limit=10
+const historyQuerySchema = z.object({
+  page: z.coerce.number().min(1).optional().default(1),
+  limit: z.coerce.number().min(1).max(50).optional().default(20),
+  status: z.enum(['ALL', 'DELIVERED', 'COMPLETED', 'CANCELED']).optional().default('ALL'),
+  search: z.string().optional()
+})
+
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, ['CUSTOMER'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
   try {
     const { searchParams } = new URL(request.url)
-    const userId = searchParams.get('userId')
-
-    if (!userId) {
-      return errorResponse('userId parameter is required', 400)
-    }
-
     const queryParams = Object.fromEntries(searchParams.entries())
-    const validatedQuery = validateQuery(orderQuerySchema, queryParams)
     
-    if (!validatedQuery) {
-      return errorResponse('Invalid query parameters', 400)
+    const parsed = historyQuerySchema.safeParse(queryParams)
+    if (!parsed.success) {
+      return errorResponse('Invalid query parameters')
     }
 
-    const { page = 1, limit = 10, search, status } = validatedQuery
-
-    // Calculate offset
+    const { page, limit, status, search } = parsed.data
     const offset = (page - 1) * limit
 
-    // Build where clause
-    const whereClause: any = {
-      customerId: userId
+    // Construire les conditions de filtrage
+    const where: any = {
+      userId: user.sub,
+      status: {
+        in: ['DELIVERED', 'COMPLETED', 'CANCELED', 'REFUNDED']
+      }
     }
 
-    // Add search filter
+    if (status !== 'ALL') {
+      where.status = status
+    }
+
     if (search) {
-      whereClause.OR = [
+      where.OR = [
         { orderNumber: { contains: search, mode: 'insensitive' } },
         { 
-          laundry: { 
-            name: { contains: search, mode: 'insensitive' } 
-          } 
+          orderItems: {
+            some: {
+              product: {
+                name: { contains: search, mode: 'insensitive' }
+              }
+            }
+          }
         }
       ]
     }
 
-    // Add status filter
-    if (status) {
-      whereClause.status = status
-    }
-
-    // Get orders with pagination
     const [orders, totalCount] = await Promise.all([
       prisma.order.findMany({
-        where: whereClause,
-        select: {
-          id: true,
-          orderNumber: true,
-          status: true,
-          finalAmount: true,
-          createdAt: true,
-          deliveryDate: true,
+        where,
+        include: {
+          orderItems: {
+            include: {
+              product: {
+                select: {
+                  name: true,
+                  category: true
+                }
+              }
+            }
+          },
           laundry: {
             select: {
-              name: true,
-              logo: true,
-              rating: true
-            }
-          },
-          address: {
-            select: {
-              street: true,
-              city: true,
-              state: true
-            }
-          },
-          _count: {
-            select: {
-              orderItems: true
+              name: true
             }
           },
           reviews: {
             select: {
               id: true,
-              rating: true,
-              comment: true
+              rating: true
             },
             take: 1
           }
         },
-        orderBy: { createdAt: 'desc' },
+        orderBy: {
+          createdAt: 'desc'
+        },
         skip: offset,
         take: limit
       }),
-
-      prisma.order.count({
-        where: whereClause
-      })
+      prisma.order.count({ where })
     ])
+
+    const formattedOrders = orders.map(order => {
+      const primaryService = order.orderItems[0]?.product.category || 'General Service'
+      const totalItems = order.orderItems.reduce((sum, item) => sum + item.quantity, 0)
+      
+      return {
+        id: order.id,
+        orderNumber: order.orderNumber,
+        status: order.status,
+        primaryService,
+        totalItems,
+        finalAmount: order.finalAmount,
+        
+        laundry: {
+          name: order.laundry.name
+        },
+        
+        dates: {
+          orderDate: order.createdAt,
+          deliveredDate: order.status === 'DELIVERED' ? order.deliveryDate : null
+        },
+        
+        actions: {
+          canReview: ['DELIVERED', 'COMPLETED'].includes(order.status) && !order.reviews.length,
+          canReorder: ['DELIVERED', 'COMPLETED'].includes(order.status),
+          hasReview: !!order.reviews.length,
+          rating: order.reviews[0]?.rating || null
+        }
+      }
+    })
 
     const totalPages = Math.ceil(totalCount / limit)
 
-    const formattedOrders = orders.map(order => ({
-      id: order.id,
-      orderNumber: order.orderNumber,
-      status: order.status,
-      placedDate: order.createdAt,
-      deliveryDate: order.deliveryDate,
-      itemCount: order._count.orderItems,
-      totalCost: order.finalAmount,
-      laundry: order.laundry,
-      deliveryAddress: `${order.address.street}, ${order.address.city}, ${order.address.state}`,
-      review: order.reviews[0] || null,
-      canReorder: ['DELIVERED', 'COMPLETED'].includes(order.status),
-      canReview: ['DELIVERED', 'COMPLETED'].includes(order.status) && !order.reviews[0]
-    }))
-
-    return paginatedResponse(
-      formattedOrders,
-      {
-        page,
-        limit,
-        total: totalCount,
-        totalPages
-      },
-      'Order history retrieved successfully'
-    )
+    return successResponse({
+      orders: formattedOrders,
+      pagination: {
+        currentPage: page,
+        totalPages,
+        totalCount,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1
+      }
+    }, 'Order history retrieved successfully')
   } catch (error) {
     console.error('Get order history error:', error)
     return errorResponse('Failed to retrieve order history', 500)
