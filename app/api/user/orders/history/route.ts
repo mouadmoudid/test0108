@@ -1,4 +1,4 @@
-// app/api/user/orders/history/route.ts - CUSTOMER uniquement
+// app/api/user/orders/history/route.ts - CUSTOMER uniquement (CORRIGÉ)
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
@@ -32,9 +32,9 @@ export async function GET(request: NextRequest) {
     const { page, limit, status, search } = parsed.data
     const offset = (page - 1) * limit
 
-    // Construire les conditions de filtrage
+    // ✅ CORRECTION: Utiliser customerId au lieu de userId
     const where: any = {
-      userId: user.sub,
+      customerId: user.sub, // ✅ CORRIGÉ: customerId au lieu de userId
       status: {
         in: ['DELIVERED', 'COMPLETED', 'CANCELED', 'REFUNDED']
       }

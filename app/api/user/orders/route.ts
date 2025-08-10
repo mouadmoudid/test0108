@@ -1,4 +1,4 @@
-// app/api/user/orders/route.ts - CUSTOMER uniquement
+// app/api/user/orders/route.ts - CUSTOMER uniquement (CORRIGÉ)
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireRole, successResponse, errorResponse } from '@/lib/auth-middleware'
@@ -23,7 +23,7 @@ const ordersQuerySchema = z.object({
   search: z.string().optional()
 })
 
-// GET /api/user/orders - CUSTOMER uniquement
+// GET /api/user/orders - CUSTOMER uniquement (CORRIGÉ)
 export async function GET(request: NextRequest) {
   const authResult = await requireRole(request, ['CUSTOMER'])
   
@@ -45,9 +45,9 @@ export async function GET(request: NextRequest) {
     const { page, limit, status, search } = parsed.data
     const offset = (page - 1) * limit
 
-    // Construire les conditions de filtrage
+    // ✅ CORRECTION: Utiliser customerId au lieu de userId
     const where: any = {
-      userId: user.sub
+      customerId: user.sub // ✅ CORRIGÉ: customerId au lieu de userId
     }
 
     if (status) {
@@ -69,6 +69,7 @@ export async function GET(request: NextRequest) {
       ]
     }
 
+    // Exécuter les requêtes en parallèle pour les performances
     const [orders, totalCount] = await Promise.all([
       prisma.order.findMany({
         where,
@@ -105,8 +106,9 @@ export async function GET(request: NextRequest) {
       prisma.order.count({ where })
     ])
 
+    // Formater les résultats
     const formattedOrders = orders.map(order => {
-      const primaryService = order.orderItems[0]?.product.category || 'Service général'
+      const primaryService = order.orderItems[0]?.product?.category || 'Service général'
       const totalItems = order.orderItems.reduce((sum, item) => sum + item.quantity, 0)
       
       return {
@@ -118,13 +120,13 @@ export async function GET(request: NextRequest) {
         finalAmount: order.finalAmount,
         
         laundry: {
-          name: order.laundry.name,
-          phone: order.laundry.phone
+          name: order.laundry?.name || 'Laundry inconnue',
+          phone: order.laundry?.phone || null
         },
         
         deliveryAddress: {
-          street: order.address.street,
-          city: order.address.city
+          street: order.address?.street || 'Adresse inconnue',
+          city: order.address?.city || 'Ville inconnue'
         },
         
         dates: {
@@ -217,7 +219,7 @@ export async function POST(request: NextRequest) {
       const product = products.find(p => p.id === item.productId)!
       const totalPrice = product.price * item.quantity
       totalAmount += totalPrice
-
+      
       return {
         productId: item.productId,
         quantity: item.quantity,
@@ -226,12 +228,9 @@ export async function POST(request: NextRequest) {
       }
     })
 
-    // Calculer les frais de livraison (logique simplifiée)
-    const deliveryFee = 20 // Vous pouvez implémenter une logique plus complexe
-
-    // Calculer les remises éventuelles
-    const discount = 0 // Vous pouvez implémenter une logique de remise
-
+    // Calculer les frais
+    const deliveryFee = 20 // À adapter selon votre logique
+    const discount = 0 // À implémenter selon vos règles
     const finalAmount = totalAmount + deliveryFee - discount
 
     // Générer un numéro de commande unique
@@ -240,11 +239,10 @@ export async function POST(request: NextRequest) {
 
     // Créer la commande avec transaction
     const newOrder = await prisma.$transaction(async (tx) => {
-      // Créer la commande
       const order = await tx.order.create({
         data: {
           orderNumber,
-          customerId: user.sub,
+          customerId: user.sub, // ✅ CORRECT: utilise customerId
           laundryId,
           addressId,
           status: 'PENDING',
